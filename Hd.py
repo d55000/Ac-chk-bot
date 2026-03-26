@@ -79,10 +79,14 @@ def make_headers():
 # ── Parsing helpers (match SB parse behaviour) ─────────────────────────
 
 def find_json_value(obj, key):
-    """Recursively find the first scalar value for key in a JSON tree."""
+    """Recursively find the first value for key in a JSON tree.
+    Returns scalars and None; skips dicts/lists (searches deeper).
+    """
     if isinstance(obj, dict):
-        if key in obj and isinstance(obj[key], (str, int, float, bool)):
-            return obj[key]
+        if key in obj:
+            val = obj[key]
+            if val is None or isinstance(val, (str, int, float, bool)):
+                return val
         for v in obj.values():
             result = find_json_value(v, key)
             if result is not None:

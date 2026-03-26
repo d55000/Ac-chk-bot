@@ -78,14 +78,18 @@ def _make_headers() -> dict[str, str]:
 # ── Parsing helpers (match SB parse behaviour) ─────────────────────────
 
 def _find_json_value(obj: object, key: str) -> object:
-    """Recursively find the first scalar value for *key* in a JSON tree.
+    """Recursively find the first value for *key* in a JSON tree.
 
-    Matches SilverBullet's ``PARSE "<SOURCE>" JSON "key"`` which does a
-    depth-first recursive search and returns the first match.
+    Returns the value if found (including ``None``), or the sentinel
+    ``_MISSING`` if the key does not exist anywhere in the tree.
+    Callers should check ``result is not _MISSING``.
     """
     if isinstance(obj, dict):
-        if key in obj and isinstance(obj[key], (str, int, float, bool)):
-            return obj[key]
+        if key in obj:
+            val = obj[key]
+            # Return scalars and None; skip dicts/lists (search deeper).
+            if val is None or isinstance(val, (str, int, float, bool)):
+                return val
         for v in obj.values():
             result = _find_json_value(v, key)
             if result is not None:
