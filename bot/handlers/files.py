@@ -266,24 +266,15 @@ async def _process_file(
 
     sem = asyncio.Semaphore(_INNER_CONCURRENCY)
 
-    async with aiohttp.ClientSession() as session:
-        for line in lines:
-            # Check for cancellation at each iteration.
-            await asyncio.sleep(0)
+    async def _process_line(line: str) -> Optional[dict]:
+        """Check a single line and return the result (or None)."""
+        return await _check_single_line(line, check_func, session, sem)
 
-            checked += 1
-
-            try:
-                result = await _check_single_line(
-                    line, check_func, session, sem
-                )
-                if result is not None:
-                    hits.append(result)
-            except Exception:
-                errors += 1
-                log.debug("Error checking line: %s", line, exc_info=True)
-
-            # Throttled status update.
+    async def _status_updater() -> None:
+        """Periodically update the Telegram status message."""
+        nonlocal last_edit
+        while checked < total:
+            await asyncio.sleep(STATUS_INTERVAL)
             now = time.monotonic()
             if now - last_edit >= STATUS_INTERVAL:
                 last_edit = now
@@ -296,6 +287,31 @@ async def _process_file(
                         f"✅ **Hits:** {len(hits)} | ❌ Errors: {errors}"
                     ),
                 )
+
+    async with aiohttp.ClientSession() as session:
+        # Launch the periodic status updater in the background.
+        updater = asyncio.create_task(_status_updater())
+
+        # Process lines concurrently in batches.
+        for batch_start in range(0, total, _INNER_CONCURRENCY):
+            batch = lines[batch_start:batch_start + _INNER_CONCURRENCY]
+            tasks = [_process_line(line) for line in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                checked += 1
+                if isinstance(result, BaseException):
+                    errors += 1
+                    log.debug("Error checking line: %s", result)
+                elif result is not None:
+                    hits.append(result)
+
+        # Stop the status updater.
+        updater.cancel()
+        try:
+            await updater
+        except asyncio.CancelledError:
+            pass
 
     # ── Final summary ───────────────────────────────────────────────────
     hit_preview = "\n".join(
