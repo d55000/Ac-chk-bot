@@ -29,7 +29,7 @@ from typing import Optional
 
 import aiofiles
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.errors import FloodWait, MessageNotModified, MessageTooLong
 from pyrogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -51,6 +51,12 @@ from bot.modules import hidive as hd_mod
 from bot.modules.proxy import proxy_manager
 from bot.utils.logger import setup_logger
 from bot.utils.task_manager import task_manager
+
+# Per-line checker timeout (seconds).  Prevents a single hung HTTP request
+# from blocking the entire processing loop.
+CHECKER_TIMEOUT: int = 120
+# Maximum FloodWait sleep when sending documents (seconds).
+MAX_FLOODWAIT_SLEEP: int = 120
 
 log = setup_logger("handlers.files")
 
@@ -105,7 +111,9 @@ async def _safe_edit(
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
-    """Edit a message, handling FloodWait and duplicate-text errors."""
+    """Edit a message, handling FloodWait, duplicate-text, and too-long errors."""
+    if len(text) > 4096:
+        text = text[:4090] + "\n…"
     try:
         await message.edit_text(text, reply_markup=reply_markup)
     except FloodWait as fw:
@@ -113,10 +121,43 @@ async def _safe_edit(
         await asyncio.sleep(fw.value)
         try:
             await message.edit_text(text, reply_markup=reply_markup)
-        except (FloodWait, MessageNotModified):
+        except (FloodWait, MessageNotModified, MessageTooLong):
             pass
     except MessageNotModified:
         pass
+    except MessageTooLong:
+        short = text[:500] + "\n…(truncated)"
+        try:
+            await message.edit_text(short, reply_markup=reply_markup)
+        except Exception:
+            pass
+
+
+async def _safe_send_document(
+    message: Message,
+    document: str,
+    caption: str = "",
+    retries: int = 3,
+) -> bool:
+    """Send a document with FloodWait retry.  Returns ``True`` on success."""
+    for attempt in range(retries):
+        try:
+            await message.reply_document(document=document, caption=caption)
+            return True
+        except FloodWait as fw:
+            wait = min(fw.value + 1, MAX_FLOODWAIT_SLEEP)
+            log.warning(
+                "FloodWait %ds sending document (attempt %d/%d) – sleeping",
+                fw.value, attempt + 1, retries,
+            )
+            await asyncio.sleep(wait)
+        except Exception:
+            log.exception(
+                "Failed to send document (attempt %d/%d)", attempt + 1, retries
+            )
+            if attempt < retries - 1:
+                await asyncio.sleep(3)
+    return False
 
 
 async def _safe_send_document(
@@ -438,11 +479,6 @@ async def _process_file(
         pass
 
     # ── Final summary (no cancel button) ────────────────────────────────
-    hit_preview = "\n".join(
-        format_hit_line(h) for h in hits[:20]
-    )
-    overflow = f"\n…and {len(hits) - 20} more." if len(hits) > 20 else ""
-
     await _safe_edit(
         message,
         (
@@ -450,8 +486,7 @@ async def _process_file(
             f"⚙️ **Module:** {module_label}\n"
             f"🆔 **Task:** `{task_id}`\n"
             f"📊 **Checked:** {total}\n"
-            f"🎯 **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}\n\n"
-            f"```\n{hit_preview}{overflow}\n```"
+            f"🎯 **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}"
         ),
     )
 
