@@ -11,10 +11,10 @@ Flow
    :class:`InlineKeyboardMarkup` for module selection.
 3. On :class:`CallbackQuery`, a unique ``task_id`` is generated, the job
    is pushed to the :class:`TaskManager`, and the message is updated with
-   the queued status.
+   the queued status (including an inline **Cancel** button).
 4. The worker processes each line using ``asyncio.to_thread`` with the
-   ``requests``-based checker modules, throttles status edits, and
-   outputs positive results dynamically.
+   ``requests``-based checker modules, throttles status edits (with a
+   persistent Cancel button), and outputs positive results dynamically.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -82,15 +83,26 @@ def _build_module_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-async def _safe_edit(message: Message, text: str) -> None:
+def _build_cancel_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    """Build an inline keyboard with a single Cancel button."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_{task_id}")]
+    ])
+
+
+async def _safe_edit(
+    message: Message,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
     """Edit a message, handling FloodWait and duplicate-text errors."""
     try:
-        await message.edit_text(text)
+        await message.edit_text(text, reply_markup=reply_markup)
     except FloodWait as fw:
         log.warning("FloodWait for %s s – sleeping", fw.value)
         await asyncio.sleep(fw.value)
         try:
-            await message.edit_text(text)
+            await message.edit_text(text, reply_markup=reply_markup)
         except (FloodWait, MessageNotModified):
             pass
     except MessageNotModified:
@@ -154,6 +166,10 @@ async def module_callback_handler(
     module_key = callback.data
     module_label = MODULES.get(module_key, module_key)
 
+    # Pre-generate a task_id so it's available for the cancel button
+    # and inside _process_file status messages.
+    task_id = uuid.uuid4().hex[:8]
+
     async def _cleanup() -> None:
         try:
             os.remove(file_path)
@@ -161,13 +177,15 @@ async def module_callback_handler(
         except OSError:
             pass
 
-    task_id = task_manager.submit(
+    task_manager.submit(
         _process_file(
             file_path=file_path,
             module_key=module_key,
             message=callback.message,
+            task_id=task_id,
         ),
         cleanup=_cleanup,
+        task_id=task_id,
     )
 
     proxy_info = f"🌐 **Proxies:** {proxy_manager.count}" if proxy_manager.count else "🌐 **Proxies:** None"
@@ -175,11 +193,12 @@ async def module_callback_handler(
         callback.message,
         (
             f"⚙️ **Module:** {module_label}\n"
-            f"🆔 **Task ID:** `{task_id}`\n"
+            f"🆔 **Task:** `{task_id}`\n"
             f"🧵 **Threads:** {proxy_manager.threads}\n"
             f"{proxy_info}\n"
             f"📌 **Status:** Queued"
         ),
+        reply_markup=_build_cancel_keyboard(task_id),
     )
     await callback.answer("Task queued!")
     log.info(
@@ -188,12 +207,33 @@ async def module_callback_handler(
     )
 
 
+# ── Callback query handler (cancel button) ─────────────────────────────
+
+@app.on_callback_query(filters.regex(r"^cancel_"))
+async def cancel_callback_handler(
+    _client: Client, callback: CallbackQuery
+) -> None:
+    """Handle the inline Cancel button press."""
+    task_id = callback.data.removeprefix("cancel_")
+
+    if await task_manager.cancel(task_id):
+        await callback.answer(f"🛑 Task {task_id} cancelled!")
+        await _safe_edit(
+            callback.message,
+            f"🛑 **Task `{task_id}` cancelled.**",
+        )
+        log.info("Task %s cancelled via button by %s", task_id, callback.from_user.id)
+    else:
+        await callback.answer("Task already finished or not found.")
+
+
 # ── File-processing worker ─────────────────────────────────────────────
 
 async def _process_file(
     file_path: str,
     module_key: str,
     message: Message,
+    task_id: str,
 ) -> None:
     """Read lines from *file_path* and process each through the selected
     module.  Uses ``asyncio.to_thread`` with a semaphore matching the
@@ -206,6 +246,7 @@ async def _process_file(
         return
     check_func, format_hit, format_hit_line = checker
 
+    cancel_kb = _build_cancel_keyboard(task_id)
     lines: list[str] = []
 
     try:
@@ -236,10 +277,12 @@ async def _process_file(
         message,
         (
             f"⚙️ **Module:** {module_label}\n"
+            f"🆔 **Task:** `{task_id}`\n"
             f"📌 **Status:** Processing…\n"
             f"🧵 **Threads:** {threads}\n"
             f"📊 **Progress:** 0/{total}"
         ),
+        reply_markup=cancel_kb,
     )
 
     sem = asyncio.Semaphore(threads)
@@ -269,33 +312,56 @@ async def _process_file(
                     message,
                     (
                         f"⚙️ **Module:** {module_label}\n"
+                        f"🆔 **Task:** `{task_id}`\n"
                         f"📌 **Status:** Processing…\n"
                         f"🧵 **Threads:** {threads}\n"
                         f"📊 **Progress:** {checked}/{total}\n"
                         f"✅ **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}"
                     ),
+                    reply_markup=cancel_kb,
                 )
 
     # Launch the periodic status updater in the background.
     updater = asyncio.create_task(_status_updater())
 
-    # Process lines concurrently in batches (sized to thread count).
-    for batch_start in range(0, total, threads):
-        batch = lines[batch_start:batch_start + threads]
-        tasks = [_check_line(line) for line in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        # Process lines concurrently in batches (sized to thread count).
+        for batch_start in range(0, total, threads):
+            batch = lines[batch_start:batch_start + threads]
+            tasks = [_check_line(line) for line in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for result in results:
-            checked += 1
-            if isinstance(result, BaseException):
-                errors += 1
-                log.debug("Error checking line: %s", result)
-            elif result is not None:
-                if result.get("free"):
-                    free += 1
-                    free_accounts.append(result)
-                else:
-                    hits.append(result)
+            for result in results:
+                checked += 1
+                if isinstance(result, BaseException):
+                    errors += 1
+                    log.debug("Error checking line: %s", result)
+                elif result is not None:
+                    if result.get("free"):
+                        free += 1
+                        free_accounts.append(result)
+                    else:
+                        hits.append(result)
+    except asyncio.CancelledError:
+        # Task was cancelled — update message and re-raise.
+        updater.cancel()
+        try:
+            await updater
+        except asyncio.CancelledError:
+            pass
+        await _safe_edit(
+            message,
+            (
+                f"🛑 **Cancelled**\n"
+                f"⚙️ **Module:** {module_label}\n"
+                f"🆔 **Task:** `{task_id}`\n"
+                f"📊 **Checked:** {checked}/{total}\n"
+                f"🎯 **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}"
+            ),
+        )
+        # Still send partial results before re-raising.
+        await _send_results(file_path, hits, free_accounts, free, module_label, format_hit_line, message)
+        raise
 
     # Stop the status updater.
     updater.cancel()
@@ -304,7 +370,7 @@ async def _process_file(
     except asyncio.CancelledError:
         pass
 
-    # ── Final summary ───────────────────────────────────────────────────
+    # ── Final summary (no cancel button) ────────────────────────────────
     hit_preview = "\n".join(
         format_hit_line(h) for h in hits[:20]
     )
@@ -315,12 +381,26 @@ async def _process_file(
         (
             f"✅ **Done!**\n"
             f"⚙️ **Module:** {module_label}\n"
+            f"🆔 **Task:** `{task_id}`\n"
             f"📊 **Checked:** {total}\n"
             f"🎯 **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}\n\n"
             f"```\n{hit_preview}{overflow}\n```"
         ),
     )
 
+    await _send_results(file_path, hits, free_accounts, free, module_label, format_hit_line, message)
+
+
+async def _send_results(
+    file_path: str,
+    hits: list[dict],
+    free_accounts: list[dict],
+    free: int,
+    module_label: str,
+    format_hit_line,
+    message: Message,
+) -> None:
+    """Save and send result files for hits and free accounts."""
     # Save hits to a results file and send it.
     if hits:
         results_path = str(

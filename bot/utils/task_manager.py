@@ -42,6 +42,7 @@ class TaskManager:
         self,
         coro: Coroutine,
         cleanup: Optional[Callable[..., Coroutine]] = None,
+        task_id: Optional[str] = None,
     ) -> str:
         """Schedule *coro* for execution and return a unique ``task_id``.
 
@@ -52,8 +53,11 @@ class TaskManager:
         cleanup:
             An optional async callable invoked on cancellation for
             releasing resources (e.g. deleting temp files).
+        task_id:
+            An optional pre-generated task ID.  When ``None`` (the
+            default), a random 8-hex-char ID is generated automatically.
         """
-        task_id = uuid.uuid4().hex[:8]
+        task_id = task_id or uuid.uuid4().hex[:8]
         task = asyncio.create_task(self._worker(task_id, coro))
         self._tasks[task_id] = task
         self._cleanups[task_id] = cleanup
