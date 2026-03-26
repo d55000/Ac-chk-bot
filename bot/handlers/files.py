@@ -160,33 +160,6 @@ async def _safe_send_document(
     return False
 
 
-async def _safe_send_document(
-    message: Message,
-    document: str,
-    caption: str = "",
-    retries: int = 3,
-) -> bool:
-    """Send a document with FloodWait retry.  Returns ``True`` on success."""
-    for attempt in range(retries):
-        try:
-            await message.reply_document(document=document, caption=caption)
-            return True
-        except FloodWait as fw:
-            wait = min(fw.value + 1, MAX_FLOODWAIT_SLEEP)
-            log.warning(
-                "FloodWait %ds sending document (attempt %d/%d) – sleeping",
-                fw.value, attempt + 1, retries,
-            )
-            await asyncio.sleep(wait)
-        except Exception:
-            log.exception(
-                "Failed to send document (attempt %d/%d)", attempt + 1, retries
-            )
-            if attempt < retries - 1:
-                await asyncio.sleep(3)
-    return False
-
-
 # ── Document upload handler ─────────────────────────────────────────────
 
 @app.on_message(
