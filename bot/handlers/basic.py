@@ -43,6 +43,7 @@ _HELP_TEXT = (
     "**Owner only:**\n"
     "  /addadmin `<user_id>` — Promote a user to admin\n"
     "  /removeadmin `<user_id>` — Demote an admin\n"
+    "  /pull — Git pull to sync deployed code\n"
 )
 
 

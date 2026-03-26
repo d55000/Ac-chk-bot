@@ -13,8 +13,10 @@ Administrative commands for the tiered RBAC system:
 - ``/clearproxy``       — Remove all loaded proxies (Admin / Owner).
 - ``/proxystatus``      — Show current proxy and thread info (Admin / Owner).
 - ``/setthreads <n>``   — Set concurrent thread count (Admin / Owner).
+- ``/pull``             — Git pull to sync the deployed repo (Owner only).
 """
 
+import asyncio
 import os
 
 from pyrogram import Client, filters
@@ -311,3 +313,47 @@ async def setthreads_handler(_client: Client, message: Message) -> None:
     log.info(
         "Threads set to %d by %s", proxy_manager.threads, message.from_user.id
     )
+
+
+# ── /pull (Owner only) ────────────────────────────────────────────────
+
+# Resolve the repository root (two levels up from bot/handlers/admin.py).
+_REPO_DIR = str(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)
+))))
+
+
+@app.on_message(filters.command("pull") & filters.private)
+async def pull_handler(_client: Client, message: Message) -> None:
+    """Run ``git pull`` to sync the deployed repo with the remote. Owner only."""
+    if message.from_user.id != OWNER_ID:
+        return
+
+    await message.reply_text("🔄 Running `git pull`…")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull",
+            cwd=_REPO_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        output = stdout.decode(errors="replace").strip() if stdout else "(no output)"
+        code = proc.returncode
+
+        if code == 0:
+            await message.reply_text(
+                f"✅ **Pull successful**\n```\n{output}\n```"
+            )
+        else:
+            await message.reply_text(
+                f"⚠️ **Pull exited with code {code}**\n```\n{output}\n```"
+            )
+        log.info("/pull by %s — exit %d: %s", message.from_user.id, code, output)
+    except asyncio.TimeoutError:
+        await message.reply_text("❌ `git pull` timed out after 60 s.")
+        log.error("/pull by %s — timed out", message.from_user.id)
+    except Exception as exc:
+        await message.reply_text(f"❌ Failed to run `git pull`: `{exc}`")
+        log.exception("/pull failed for %s", message.from_user.id)
