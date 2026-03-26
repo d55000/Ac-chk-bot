@@ -19,4 +19,5 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workdir="data",            # Session file stored inside the data dir
+    in_memory=True,            # Fresh session each run (avoids stale session bugs)
 )
