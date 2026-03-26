@@ -54,10 +54,13 @@ MODULES: dict[str, str] = {
     "mod_hd": "📺 Hidive",
 }
 
-# Maps module keys to (check_func, format_hit, format_hit_line).
+# Maps module keys to (sync_check_func, format_hit, format_hit_line).
+# We use the *synchronous* functions directly so we can run them in a
+# dedicated ``ThreadPoolExecutor`` via ``loop.run_in_executor(executor, …)``
+# rather than setting a global default executor (which breaks ``aiofiles``).
 _CHECKERS = {
-    "mod_cr": (cr_mod.check_account, cr_mod.format_hit, cr_mod.format_hit_line),
-    "mod_hd": (hd_mod.check_account, hd_mod.format_hit, hd_mod.format_hit_line),
+    "mod_cr": (cr_mod._check_sync, cr_mod.format_hit, cr_mod.format_hit_line),
+    "mod_hd": (hd_mod._check_sync, hd_mod.format_hit, hd_mod.format_hit_line),
 }
 
 # Map of pending file paths keyed by "<user_id>:<message_id>".
@@ -286,13 +289,12 @@ async def _process_file(
         reply_markup=cancel_kb,
     )
 
-    # Ensure the default thread-pool executor has enough workers so that
-    # ``asyncio.to_thread`` can actually run ``threads`` blocking checks
-    # concurrently.  Python's default executor caps at min(32, cpu+4)
-    # which is far too few for 50+ threads.
+    # Create a dedicated thread-pool executor for blocking checker calls.
+    # We intentionally do NOT set this as the loop's default executor
+    # because that would break ``aiofiles`` when we shut it down later.
+    # Instead we pass it explicitly to ``loop.run_in_executor()``.
     loop = asyncio.get_running_loop()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
-    loop.set_default_executor(executor)
 
     sem = asyncio.Semaphore(threads)
 
@@ -307,7 +309,9 @@ async def _process_file(
             return None
         proxy = proxy_manager.next()
         async with sem:
-            return await check_func(email, password, proxy)
+            return await loop.run_in_executor(
+                executor, check_func, email, password, proxy
+            )
 
     async def _status_updater() -> None:
         """Periodically update the Telegram status message."""
