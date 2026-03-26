@@ -20,10 +20,10 @@ import asyncio
 import functools
 import logging
 import os
-import signal
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Coroutine
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -32,6 +32,7 @@ import aiohttp
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -234,7 +235,11 @@ async def _process_module_b(line: str, session: aiohttp.ClientSession) -> dict[s
 
 
 # Map callback data → processing function
-MODULE_MAP: dict[str, Any] = {
+# Type alias for module processing functions
+ProcessFn = Callable[[str, aiohttp.ClientSession], Coroutine[Any, Any, dict[str, Any]]]
+
+# Map callback data → (display_name, processing_function)
+MODULE_MAP: dict[str, tuple[str, ProcessFn]] = {
     "module_a": ("Module A", _process_module_a),
     "module_b": ("Module B", _process_module_b),
 }
@@ -316,8 +321,8 @@ async def _run_processing(
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
             last_edit_time = time.monotonic()
-        except Exception:
-            # Swallow FloodWait / message-not-modified errors silently
+        except (RetryAfter, BadRequest, TimedOut):
+            # Suppress expected rate-limiting and message-not-modified errors
             logger.debug("Status edit skipped (rate-limited or unchanged).")
 
     async def _worker(line: str) -> None:
@@ -370,8 +375,8 @@ async def _run_processing(
             text=done_text,
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-    except Exception:
-        logger.debug("Could not edit final status message.")
+    except (RetryAfter, BadRequest, TimedOut):
+        logger.debug("Could not edit final status message.", exc_info=True)
 
     logger.info(
         "Processing complete for %s — %d/%d success.",
@@ -421,7 +426,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Download file to a secure temp directory
     tg_file = await document.get_file()
-    local_path = os.path.join(TEMP_DIR, f"{update.effective_user.id}_{document.file_name}")
+    safe_name = os.path.basename(document.file_name)
+    local_path = os.path.join(TEMP_DIR, f"{update.effective_user.id}_{safe_name}")
     await tg_file.download_to_drive(local_path)
     logger.info("File downloaded: %s (%d bytes)", local_path, document.file_size or 0)
 
@@ -491,15 +497,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Clear pending data so re-presses don't re-trigger
     context.user_data.pop("pending_lines", None)
 
-    # Run the processing loop in the background so the bot stays responsive
-    asyncio.create_task(
+    # Run the processing loop in the background so the bot stays responsive.
+    # Using context.application.create_task() ensures proper exception handling
+    # and task tracking by the python-telegram-bot framework.
+    context.application.create_task(
         _run_processing(
             lines=lines,
             module_key=module_key,
             chat_id=query.message.chat_id,
             status_message_id=status_msg.message_id,
             context=context,
-        )
+        ),
+        update=update,
     )
 
 # ---------------------------------------------------------------------------
@@ -540,15 +549,7 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Install signal handlers for graceful shutdown (Unix only)
-    if sys.platform != "win32":
-        loop = asyncio.new_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: logger.info("Received signal %s — stopping…", s.name),
-            )
-        loop.close()
+    # python-telegram-bot handles SIGINT/SIGTERM internally for graceful shutdown.
 
     # Start polling (blocks until stopped)
     app.run_polling(

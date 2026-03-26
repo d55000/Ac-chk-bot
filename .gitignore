@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+
+# Logs
+bot.log
+bot.log.*
+
+# Temp files
+*.tmp
