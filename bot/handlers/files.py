@@ -20,6 +20,7 @@ Flow
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import time
 import uuid
@@ -285,6 +286,14 @@ async def _process_file(
         reply_markup=cancel_kb,
     )
 
+    # Ensure the default thread-pool executor has enough workers so that
+    # ``asyncio.to_thread`` can actually run ``threads`` blocking checks
+    # concurrently.  Python's default executor caps at min(32, cpu+4)
+    # which is far too few for 50+ threads.
+    loop = asyncio.get_running_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+    loop.set_default_executor(executor)
+
     sem = asyncio.Semaphore(threads)
 
     async def _check_line(line: str) -> Optional[dict]:
@@ -324,26 +333,33 @@ async def _process_file(
     # Launch the periodic status updater in the background.
     updater = asyncio.create_task(_status_updater())
 
-    try:
-        # Process lines concurrently in batches (sized to thread count).
-        for batch_start in range(0, total, threads):
-            batch = lines[batch_start:batch_start + threads]
-            tasks = [_check_line(line) for line in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Fire ALL tasks at once — the semaphore limits to `threads` at a
+    # time.  This matches how the standalone scripts submit everything to
+    # a ThreadPoolExecutor immediately instead of waiting per-batch.
+    all_tasks = [asyncio.create_task(_check_line(line)) for line in lines]
 
-            for result in results:
-                checked += 1
-                if isinstance(result, BaseException):
-                    errors += 1
-                    log.debug("Error checking line: %s", result)
-                elif result is not None:
+    try:
+        for coro in asyncio.as_completed(all_tasks):
+            try:
+                result = await coro
+            except Exception as exc:
+                errors += 1
+                log.debug("Error checking line: %s", exc)
+            else:
+                if result is not None:
                     if result.get("free"):
                         free += 1
                         free_accounts.append(result)
                     else:
                         hits.append(result)
+            checked += 1
     except asyncio.CancelledError:
-        # Task was cancelled — update message and re-raise.
+        # Cancel all remaining tasks on cancellation.
+        for t in all_tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
+
         updater.cancel()
         try:
             await updater
@@ -362,6 +378,8 @@ async def _process_file(
         # Still send partial results before re-raising.
         await _send_results(file_path, hits, free_accounts, free, module_label, format_hit_line, message)
         raise
+    finally:
+        executor.shutdown(wait=False)
 
     # Stop the status updater.
     updater.cancel()
