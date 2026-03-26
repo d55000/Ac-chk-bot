@@ -150,7 +150,10 @@ async def check_account(
             "country": country_full,
         }
 
-    except Exception as exc:
+    except (
+        aiohttp.ClientError, TimeoutError,
+        KeyError, TypeError, ValueError, IndexError, AttributeError,
+    ) as exc:
         log.debug("CR check failed for %s: %s", email, exc)
         return None
 

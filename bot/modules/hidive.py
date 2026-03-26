@@ -121,7 +121,10 @@ async def check_account(
             "country": country,
         }
 
-    except Exception as exc:
+    except (
+        aiohttp.ClientError, TimeoutError,
+        KeyError, TypeError, ValueError, IndexError, AttributeError,
+    ) as exc:
         log.debug("HD check failed for %s: %s", email, exc)
         return None
 
