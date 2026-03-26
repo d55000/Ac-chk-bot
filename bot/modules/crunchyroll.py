@@ -74,8 +74,9 @@ async def check_account(
             _AUTH_URL, data=data, headers=_HEADERS, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)
         ) as r1:
             if r1.status != 200:
+                log.debug("CR auth failed for %s: HTTP %s", email, r1.status)
                 return None
-            auth = await r1.json()
+            auth = await r1.json(content_type=None)
 
         token = auth.get("access_token")
         pid = auth.get("profile_id")
@@ -89,7 +90,7 @@ async def check_account(
             _ACCOUNT_URL, headers=auth_headers, proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r2:
-            acc = await r2.json()
+            acc = await r2.json(content_type=None)
 
         email_verified = acc.get("email_verified", False)
         guid = acc.get("external_id")
@@ -101,10 +102,10 @@ async def check_account(
             _BENEFITS_URL.format(guid=guid), headers=auth_headers,
             proxy=proxy, timeout=aiohttp.ClientTimeout(total=10),
         ) as r3:
-            benefits = await r3.json()
+            benefits = await r3.json(content_type=None)
 
         if benefits.get("total", 0) == 0:
-            return None  # Free account.
+            return {"email": email, "password": password, "free": True}
 
         country_code = benefits.get("subscription_country", "Unknown")
         country_full = _COUNTRY_MAP.get(country_code, country_code)
@@ -126,7 +127,7 @@ async def check_account(
             _SUBS_URL.format(pid=pid), headers=auth_headers,
             proxy=proxy, timeout=aiohttp.ClientTimeout(total=10),
         ) as r4:
-            subs_data = await r4.json()
+            subs_data = await r4.json(content_type=None)
 
         for sub in subs_data.get("subscriptions", []):
             nrd = sub.get("nextRenewalDate")
@@ -149,7 +150,7 @@ async def check_account(
             "country": country_full,
         }
 
-    except (aiohttp.ClientError, TimeoutError, KeyError, TypeError) as exc:
+    except Exception as exc:
         log.debug("CR check failed for %s: %s", email, exc)
         return None
 

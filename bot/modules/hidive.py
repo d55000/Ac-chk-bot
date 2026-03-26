@@ -76,7 +76,7 @@ async def check_account(
             lic_text = await r2.text()
 
         if '"status":"ACTIVE"' not in lic_text:
-            return None  # No active subscription.
+            return {"email": email, "password": password, "free": True}
 
         lic_data = json.loads(lic_text)
         family = lic_data.get("licenceFamilies", [{}])[0]
@@ -99,14 +99,14 @@ async def check_account(
             _PROFILE_URL, headers=auth_headers, proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r_prof:
-            prof_data = await r_prof.json()
+            prof_data = await r_prof.json(content_type=None)
         pin_protected = prof_data.get("pinProtection") == "PROTECTED"
 
         async with session.get(
             _ADDRESS_URL, headers=auth_headers, proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as r_addr:
-            addr_data = await r_addr.json()
+            addr_data = await r_addr.json(content_type=None)
         country_code = addr_data.get("countryCode", "US")
         country = "United States 🇺🇸" if country_code == "US" else country_code
 
@@ -121,7 +121,7 @@ async def check_account(
             "country": country,
         }
 
-    except (aiohttp.ClientError, TimeoutError, KeyError, TypeError) as exc:
+    except Exception as exc:
         log.debug("HD check failed for %s: %s", email, exc)
         return None
 

