@@ -10,6 +10,7 @@ so they can learn about the bot before requesting access.
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
+from bot.core.client import app
 from bot.core.config import OWNER_ID
 from bot.database.db import is_admin, is_authorized
 from bot.utils.logger import setup_logger
@@ -52,7 +53,7 @@ async def _resolve_role(user_id: int) -> str:
     return "🚫 Unauthorized"
 
 
-@Client.on_message(filters.command("start") & filters.private)
+@app.on_message(filters.command("start") & filters.private)
 async def start_handler(_client: Client, message: Message) -> None:
     """Respond to ``/start`` with a greeting and current role."""
     role = await _resolve_role(message.from_user.id)
@@ -60,7 +61,7 @@ async def start_handler(_client: Client, message: Message) -> None:
     log.info("/start from %s (role=%s)", message.from_user.id, role)
 
 
-@Client.on_message(filters.command("help") & filters.private)
+@app.on_message(filters.command("help") & filters.private)
 async def help_handler(_client: Client, message: Message) -> None:
     """Respond to ``/help`` with the list of commands."""
     await message.reply_text(_HELP_TEXT)

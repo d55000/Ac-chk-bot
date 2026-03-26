@@ -14,6 +14,7 @@ Administrative commands for the tiered RBAC system:
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
+from bot.core.client import app
 from bot.core.config import OWNER_ID
 from bot.database import db
 from bot.utils.logger import setup_logger
@@ -46,7 +47,7 @@ def _parse_user_id(message: Message) -> int | None:
 
 # ── /auth ───────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("auth") & filters.private)
+@app.on_message(filters.command("auth") & filters.private)
 async def auth_handler(_client: Client, message: Message) -> None:
     """Authorize a user so they can upload and process files."""
     if not await _is_admin_or_owner(message.from_user.id):
@@ -66,7 +67,7 @@ async def auth_handler(_client: Client, message: Message) -> None:
 
 # ── /unauth ─────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("unauth") & filters.private)
+@app.on_message(filters.command("unauth") & filters.private)
 async def unauth_handler(_client: Client, message: Message) -> None:
     """Revoke a user's authorization."""
     if not await _is_admin_or_owner(message.from_user.id):
@@ -88,7 +89,7 @@ async def unauth_handler(_client: Client, message: Message) -> None:
 
 # ── /addadmin (Owner only) ──────────────────────────────────────────────
 
-@Client.on_message(filters.command("addadmin") & filters.private)
+@app.on_message(filters.command("addadmin") & filters.private)
 async def addadmin_handler(_client: Client, message: Message) -> None:
     """Promote a user to admin. Owner only."""
     if message.from_user.id != OWNER_ID:
@@ -112,7 +113,7 @@ async def addadmin_handler(_client: Client, message: Message) -> None:
 
 # ── /removeadmin (Owner only) ──────────────────────────────────────────
 
-@Client.on_message(filters.command("removeadmin") & filters.private)
+@app.on_message(filters.command("removeadmin") & filters.private)
 async def removeadmin_handler(_client: Client, message: Message) -> None:
     """Demote an admin. Owner only."""
     if message.from_user.id != OWNER_ID:
@@ -136,7 +137,7 @@ async def removeadmin_handler(_client: Client, message: Message) -> None:
 
 # ── /cancel ─────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("cancel") & filters.private)
+@app.on_message(filters.command("cancel") & filters.private)
 async def cancel_handler(_client: Client, message: Message) -> None:
     """Cancel a running task by its task_id."""
     if not await _is_admin_or_owner(message.from_user.id):
@@ -163,7 +164,7 @@ async def cancel_handler(_client: Client, message: Message) -> None:
 
 # ── /stats ──────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("stats") & filters.private)
+@app.on_message(filters.command("stats") & filters.private)
 async def stats_handler(_client: Client, message: Message) -> None:
     """Show bot statistics: user counts and active tasks."""
     if not await _is_admin_or_owner(message.from_user.id):
