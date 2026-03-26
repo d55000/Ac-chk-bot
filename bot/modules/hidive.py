@@ -75,7 +75,7 @@ async def check_account(
         ) as r2:
             lic_text = await r2.text()
 
-        if 'status":"ACTIVE' not in lic_text:
+        if '"status":"ACTIVE"' not in lic_text:
             return None  # No active subscription.
 
         lic_data = json.loads(lic_text)
