@@ -59,8 +59,6 @@ class ProxyManager:
                     if len(parts) == 4:
                         host, port, user, pw = parts
                         url = f"http://{user}:{pw}@{host}:{port}"
-                    elif len(parts) == 2:
-                        url = f"http://{line}"
                     else:
                         url = f"http://{line}"
                     proxies.append({"http": url, "https": url})
@@ -86,8 +84,6 @@ class ProxyManager:
             if len(parts) == 4:
                 host, port, user, pw = parts
                 url = f"http://{user}:{pw}@{host}:{port}"
-            elif len(parts) == 2:
-                url = f"http://{line}"
             else:
                 url = f"http://{line}"
             proxies.append({"http": url, "https": url})

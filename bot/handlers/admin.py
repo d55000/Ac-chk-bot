@@ -15,6 +15,8 @@ Administrative commands for the tiered RBAC system:
 - ``/setthreads <n>``   — Set concurrent thread count (Admin / Owner).
 """
 
+import os
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -236,7 +238,6 @@ async def setproxy_handler(_client: Client, message: Message) -> None:
         await message.reply_text("❌ Failed to load proxy file.")
     finally:
         try:
-            import os
             os.remove(tmp_path)
         except OSError:
             pass
@@ -253,7 +254,6 @@ async def clearproxy_handler(_client: Client, message: Message) -> None:
     proxy_manager.clear()
     # Also remove the saved file.
     try:
-        import os
         os.remove(PROXY_FILE)
     except OSError:
         pass

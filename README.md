@@ -137,6 +137,10 @@ docker rm ac-chk-bot
 | `/removeadmin <user_id>` | Owner | Demote an admin |
 | `/cancel <task_id>` | Admin / Owner | Cancel a running task |
 | `/stats` | Admin / Owner | Show bot statistics |
+| `/setproxy` | Admin / Owner | Reply to a `.txt` proxy file to load proxies |
+| `/clearproxy` | Admin / Owner | Remove all loaded proxies |
+| `/proxystatus` | Admin / Owner | Show proxy & thread configuration |
+| `/setthreads <n>` | Admin / Owner | Set concurrent threads (1–200, default 50) |
 
 ---
 
@@ -151,6 +155,7 @@ docker rm ac-chk-bot
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `MAX_WORKERS` | `50` | Max concurrent processing tasks |
 | `STATUS_INTERVAL` | `5` | Seconds between status-message edits |
+| `DEFAULT_THREADS` | `50` | Default concurrent threads for checking |
 
 ---
 
