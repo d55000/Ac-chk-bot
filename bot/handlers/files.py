@@ -39,6 +39,12 @@ from pyrogram.types import (
 
 from bot.core.client import app
 from bot.core.config import OWNER_ID, STATUS_INTERVAL, TEMP_DIR
+
+# Per-line checker timeout (seconds).  Prevents a single hung HTTP request
+# from blocking the entire processing loop.
+CHECKER_TIMEOUT: int = 120
+# Maximum FloodWait sleep when sending documents (seconds).
+MAX_FLOODWAIT_SLEEP: int = 120
 from bot.database.db import is_admin, is_authorized
 from bot.modules import crunchyroll as cr_mod
 from bot.modules import hidive as hd_mod
@@ -111,6 +117,33 @@ async def _safe_edit(
             pass
     except MessageNotModified:
         pass
+
+
+async def _safe_send_document(
+    message: Message,
+    document: str,
+    caption: str = "",
+    retries: int = 3,
+) -> bool:
+    """Send a document with FloodWait retry.  Returns ``True`` on success."""
+    for attempt in range(retries):
+        try:
+            await message.reply_document(document=document, caption=caption)
+            return True
+        except FloodWait as fw:
+            wait = min(fw.value + 1, MAX_FLOODWAIT_SLEEP)
+            log.warning(
+                "FloodWait %ds sending document (attempt %d/%d) – sleeping",
+                fw.value, attempt + 1, retries,
+            )
+            await asyncio.sleep(wait)
+        except Exception:
+            log.exception(
+                "Failed to send document (attempt %d/%d)", attempt + 1, retries
+            )
+            if attempt < retries - 1:
+                await asyncio.sleep(3)
+    return False
 
 
 # ── Document upload handler ─────────────────────────────────────────────
@@ -309,9 +342,16 @@ async def _process_file(
             return None
         proxy = proxy_manager.next()
         async with sem:
-            return await loop.run_in_executor(
-                executor, check_func, email, password, proxy
-            )
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(
+                        executor, check_func, email, password, proxy
+                    ),
+                    timeout=CHECKER_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.debug("Timeout checking %s", email)
+                return None
 
     async def _status_updater() -> None:
         """Periodically update the Telegram status message."""
@@ -380,7 +420,12 @@ async def _process_file(
             ),
         )
         # Still send partial results before re-raising.
-        await _send_results(file_path, hits, free_accounts, free, module_label, format_hit_line, message)
+        try:
+            await asyncio.shield(
+                _send_results(file_path, hits, free_accounts, free, module_label, format_hit_line, message)
+            )
+        except asyncio.CancelledError:
+            pass
         raise
     finally:
         executor.shutdown(wait=False)
@@ -434,12 +479,15 @@ async def _send_results(
                 await rf.write(
                     "\n".join(format_hit_line(h) for h in hits)
                 )
-            await message.reply_document(
-                document=results_path,
+            sent = await _safe_send_document(
+                message,
+                results_path,
                 caption=f"🎯 {len(hits)} hits from {module_label}",
             )
+            if not sent:
+                log.error("All retries exhausted sending results file")
         except Exception:
-            log.exception("Failed to send results file")
+            log.exception("Failed to write results file")
         finally:
             try:
                 os.remove(results_path)
@@ -460,12 +508,15 @@ async def _send_results(
                         for a in free_accounts
                     )
                 )
-            await message.reply_document(
-                document=free_path,
+            sent = await _safe_send_document(
+                message,
+                free_path,
                 caption=f"🆓 {free} free accounts from {module_label}",
             )
+            if not sent:
+                log.error("All retries exhausted sending free accounts file")
         except Exception:
-            log.exception("Failed to send free accounts file")
+            log.exception("Failed to write free accounts file")
         finally:
             try:
                 os.remove(free_path)
