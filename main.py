@@ -19,6 +19,7 @@ from pyrogram import idle
 from bot.core.client import app
 from bot.core.config import LOG_LEVEL, OWNER_ID
 from bot.database.db import init_db
+from bot.modules.proxy import proxy_manager
 from bot.utils.logger import setup_logger
 
 # ── Import handler modules to register their decorators on `app` ────────
@@ -30,9 +31,13 @@ log = setup_logger("main", level=LOG_LEVEL)
 
 
 async def main() -> None:
-    """Bootstrap the bot: init DB → start Pyrogram client."""
+    """Bootstrap the bot: init DB → load proxies → start Pyrogram client."""
     log.info("Initialising database…")
     await init_db()
+
+    # Load saved proxies if present.
+    loaded = proxy_manager.load_from_file()
+    log.info("Proxies: %d loaded, threads: %d", loaded, proxy_manager.threads)
 
     log.info("Starting bot…")
     await app.start()

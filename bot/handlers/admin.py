@@ -9,14 +9,19 @@ Administrative commands for the tiered RBAC system:
 - ``/removeadmin <id>`` — Demote an admin (Owner only).
 - ``/cancel <task_id>`` — Cancel a running task (Admin / Owner).
 - ``/stats``            — Show bot statistics (Admin / Owner).
+- ``/setproxy``         — Upload a proxies.txt file (Admin / Owner).
+- ``/clearproxy``       — Remove all loaded proxies (Admin / Owner).
+- ``/proxystatus``      — Show current proxy and thread info (Admin / Owner).
+- ``/setthreads <n>``   — Set concurrent thread count (Admin / Owner).
 """
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 from bot.core.client import app
-from bot.core.config import OWNER_ID
+from bot.core.config import OWNER_ID, PROXY_FILE, TEMP_DIR
 from bot.database import db
+from bot.modules.proxy import proxy_manager
 from bot.utils.logger import setup_logger
 from bot.utils.task_manager import task_manager
 
@@ -179,6 +184,130 @@ async def stats_handler(_client: Client, message: Message) -> None:
         f"🛡️ Admins: **{db_stats['admins']}**\n"
         f"✅ Authorized users: **{db_stats['authorized']}**\n"
         f"⚙️ Active tasks: **{active}**\n"
+        f"🧵 Threads: **{proxy_manager.threads}**\n"
+        f"🌐 Proxies loaded: **{proxy_manager.count}**\n"
     )
     await message.reply_text(text)
     log.info("/stats requested by %s", message.from_user.id)
+
+
+# ── /setproxy (upload proxies.txt) ─────────────────────────────────────
+
+@app.on_message(filters.command("setproxy") & filters.private)
+async def setproxy_handler(_client: Client, message: Message) -> None:
+    """Load proxies from a replied-to .txt file or prompt user to reply."""
+    if not await _is_admin_or_owner(message.from_user.id):
+        return
+
+    # Check if replying to a document.
+    reply = message.reply_to_message
+    if not reply or not reply.document:
+        await message.reply_text(
+            "⚠️ **Usage:** Reply to a `.txt` proxy file with `/setproxy`\n\n"
+            "**Proxy format** (one per line):\n"
+            "`host:port`\n"
+            "`host:port:user:pass`"
+        )
+        return
+
+    doc = reply.document
+    if not doc.file_name or not doc.file_name.lower().endswith(".txt"):
+        await message.reply_text("⚠️ Please reply to a `.txt` file.")
+        return
+
+    # Download and load.
+    tmp_path = str(TEMP_DIR / f"proxy_{message.from_user.id}.txt")
+    try:
+        await reply.download(file_name=tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        # Save to the persistent proxy file location.
+        proxy_manager.save_to_file(text, PROXY_FILE)
+        count = proxy_manager.load_from_text(text)
+        await message.reply_text(
+            f"✅ **Proxies loaded:** {count}\n"
+            f"🧵 **Threads:** {proxy_manager.threads}"
+        )
+        log.info(
+            "%d proxies loaded by user %s", count, message.from_user.id
+        )
+    except Exception:
+        log.exception("Failed to load proxies")
+        await message.reply_text("❌ Failed to load proxy file.")
+    finally:
+        try:
+            import os
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ── /clearproxy ────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("clearproxy") & filters.private)
+async def clearproxy_handler(_client: Client, message: Message) -> None:
+    """Remove all loaded proxies."""
+    if not await _is_admin_or_owner(message.from_user.id):
+        return
+
+    proxy_manager.clear()
+    # Also remove the saved file.
+    try:
+        import os
+        os.remove(PROXY_FILE)
+    except OSError:
+        pass
+    await message.reply_text("✅ All proxies cleared. Running proxyless.")
+    log.info("Proxies cleared by %s", message.from_user.id)
+
+
+# ── /proxystatus ───────────────────────────────────────────────────────
+
+@app.on_message(filters.command("proxystatus") & filters.private)
+async def proxystatus_handler(_client: Client, message: Message) -> None:
+    """Show current proxy and thread configuration."""
+    if not await _is_admin_or_owner(message.from_user.id):
+        return
+
+    count = proxy_manager.count
+    threads = proxy_manager.threads
+    status = "Active ✅" if count > 0 else "None ❌"
+    await message.reply_text(
+        f"🌐 **Proxy Status**\n\n"
+        f"📋 **Loaded:** {count} proxies\n"
+        f"🔌 **Status:** {status}\n"
+        f"🧵 **Threads:** {threads}"
+    )
+
+
+# ── /setthreads ────────────────────────────────────────────────────────
+
+@app.on_message(filters.command("setthreads") & filters.private)
+async def setthreads_handler(_client: Client, message: Message) -> None:
+    """Set the number of concurrent threads for checking."""
+    if not await _is_admin_or_owner(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text(
+            f"⚠️ Usage: `/setthreads <number>`\n"
+            f"Current: **{proxy_manager.threads}** (range: 1–200)"
+        )
+        return
+
+    try:
+        n = int(parts[1].strip())
+    except ValueError:
+        await message.reply_text("⚠️ Please provide a valid number.")
+        return
+
+    if n < 1 or n > 200:
+        await message.reply_text("⚠️ Thread count must be between 1 and 200.")
+        return
+
+    proxy_manager.threads = n
+    await message.reply_text(f"✅ Threads set to **{proxy_manager.threads}**")
+    log.info(
+        "Threads set to %d by %s", proxy_manager.threads, message.from_user.id
+    )

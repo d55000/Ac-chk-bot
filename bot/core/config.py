@@ -26,6 +26,7 @@ OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "50"))
 STATUS_INTERVAL: int = int(os.getenv("STATUS_INTERVAL", "5"))
+DEFAULT_THREADS: int = int(os.getenv("DEFAULT_THREADS", "50"))
 
 # ── Paths ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
@@ -33,3 +34,4 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH: str = str(DATA_DIR / "bot.db")
 TEMP_DIR = Path(__file__).resolve().parents[2] / "data" / "tmp"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+PROXY_FILE = str(DATA_DIR / "proxies.txt")
