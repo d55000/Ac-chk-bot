@@ -155,7 +155,7 @@ def check(account, proxies):
 
         sub_text = sub_res.text
 
-        # Parse captures
+        # Parse captures — direct path access first (most reliable)
         plan_name = ""
         plan_type = ""
         auto_renewal = ""
@@ -164,54 +164,66 @@ def check(account, proxies):
         expiry_date = "N/A"
         days_left = "0"
 
-        # JSON-parsed fields (SB: PARSE "<SOURCE>" JSON "key" — recursive)
         data = None
         try:
             data = sub_res.json()
-            plan_name = str(find_json_value(data, "name") or "")
-            plan_type = str(find_json_value(data, "type") or "")
-            auto_renewal = str(find_json_value(data, "paymentEventType") or "")
         except: pass
 
-        # LR-parsed: Payment Provider
-        payment_provider = lr_parse(sub_text, '"paymentProviderInfo":{"type":"', '"')
+        families = []
+        if isinstance(data, dict):
+            families = data.get("licenceFamilies", [])
 
-        # LR-parsed: Account Status (two-step, matching SB config)
-        chunk = lr_parse(sub_text, '"displayStyle":', '"paymentProviderInfo"')
-        if chunk:
-            account_status = lr_parse(chunk, '"status":"', '",')
-            if not account_status:
-                account_status = lr_parse(chunk, '"status":"', '"')
+        if families and isinstance(families, list) and len(families) > 0:
+            fam = families[0]
+            if isinstance(fam, dict):
+                plan_name = str(fam.get("name") or "")
+                plan_type = str(fam.get("type") or "")
+                auto_renewal = str(fam.get("paymentEventType") or "")
+                account_status = str(fam.get("status") or "")
+                ppi = fam.get("paymentProviderInfo")
+                if isinstance(ppi, dict):
+                    payment_provider = str(ppi.get("type") or "")
+                expiry_ms = fam.get("expiryTimestamp")
+                if expiry_ms and isinstance(expiry_ms, (int, float)) and expiry_ms > 0:
+                    try:
+                        dt = datetime.fromtimestamp(expiry_ms / 1000)
+                        expiry_date = dt.strftime("%Y-%m-%d")
+                        days_left = str(max(0, (dt - datetime.now()).days))
+                    except: pass
 
-        # Fallback: JSON for status
+        # Fallback: recursive JSON search
+        if not account_status and data:
+            val = find_json_value(data, "status")
+            if val and isinstance(val, str):
+                account_status = val
+        if not plan_name and data:
+            val = find_json_value(data, "name")
+            if val:
+                plan_name = str(val)
+
+        # Fallback: LR parse for status
         if not account_status:
-            try:
-                if data is None:
-                    data = sub_res.json()
-                val = find_json_value(data, "status")
-                if val and isinstance(val, str):
-                    account_status = val
-            except: pass
+            chunk = lr_parse(sub_text, '"displayStyle":', '"paymentProviderInfo"')
+            if chunk:
+                account_status = lr_parse(chunk, '"status":"', '",')
+                if not account_status:
+                    account_status = lr_parse(chunk, '"status":"', '"')
 
-        # LR-parsed: expiryTimestamp
-        expiry_raw = lr_parse(sub_text, '"expiryTimestamp":', ',"')
-        if not expiry_raw:
+        # Fallback: LR for payment provider
+        if not payment_provider:
+            payment_provider = lr_parse(sub_text, '"paymentProviderInfo":{"type":"', '"')
+
+        # Fallback: LR for expiry
+        if expiry_date == "N/A":
             expiry_raw = lr_parse(sub_text, '"expiryTimestamp":', ',')
-        if not expiry_raw:
-            try:
-                ts = find_json_value(data if data else sub_res.json(), "expiryTimestamp")
-                if ts:
-                    expiry_raw = str(ts)
-            except: pass
-
-        if expiry_raw:
-            try:
-                expiry_ms = int(str(expiry_raw).strip())
-                if expiry_ms > 0:
-                    dt = datetime.fromtimestamp(expiry_ms / 1000)
-                    expiry_date = dt.strftime("%Y-%m-%d")
-                    days_left = str(max(0, (dt - datetime.now()).days))
-            except: pass
+            if expiry_raw:
+                try:
+                    ts = int(str(expiry_raw).strip().rstrip(',"'))
+                    if ts > 0:
+                        dt = datetime.fromtimestamp(ts / 1000)
+                        expiry_date = dt.strftime("%Y-%m-%d")
+                        days_left = str(max(0, (dt - datetime.now()).days))
+                except: pass
 
         # KEYCHECK: exactly "ACTIVE" → HIT, else → FREE
         # NOTE: "INACTIVE" contains "ACTIVE" as substring, so use exact match

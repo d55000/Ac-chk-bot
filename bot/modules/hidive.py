@@ -175,7 +175,7 @@ def _check_sync(
         )
         r2_text = r2.text
 
-        # -- Parse captures matching SB config exactly --
+        # -- Parse captures --
         plan_name = ""
         plan_type = ""
         auto_renewal = ""
@@ -184,78 +184,91 @@ def _check_sync(
         expiry_date = "N/A"
         days_left = "0"
 
-        # ── JSON-parsed fields ──────────────────────────────────────────
-        # SB: PARSE "<SOURCE>" JSON "name"            → CAP "Plan"
-        # SB: PARSE "<SOURCE>" JSON "type"            → CAP "Plan Type"
-        # SB: PARSE "<SOURCE>" JSON "paymentEventType"→ CAP "Has Auto Renewal"
-        # These are recursive searches on the full response JSON.
+        # ── Primary: direct path access to licenceFamilies[0] ──────────
+        # This is the most reliable method — matches the actual API
+        # structure.  Recursive search and LR parsing serve as fallbacks.
         data = None
         try:
             data = r2.json()
-            plan_name = str(_find_json_value(data, "name") or "")
-            plan_type = str(_find_json_value(data, "type") or "")
-            auto_renewal = str(
-                _find_json_value(data, "paymentEventType") or ""
-            )
         except Exception:
             pass
 
-        # ── LR-parsed fields ───────────────────────────────────────────
-        # SB: PARSE "<SOURCE>" LR '"paymentProviderInfo":{"type":"' '"'
-        payment_provider = _lr_parse(
-            r2_text,
-            '"paymentProviderInfo":{"type":"',
-            '"',
-        )
+        families = []
+        if isinstance(data, dict):
+            families = data.get("licenceFamilies", [])
 
-        # Account Status – two-step LR, exactly as SB config:
-        # Step 1: PARSE "<SOURCE>" LR '"displayStyle":' '"paymentProviderInfo"'
-        chunk = _lr_parse(
-            r2_text, '"displayStyle":', '"paymentProviderInfo"'
-        )
-        # Step 2: PARSE "<1>" LR '"status":"' '",'
-        if chunk:
-            account_status = _lr_parse(chunk, '"status":"', '",')
-            if not account_status:
-                # Try without trailing comma (last field before })
-                account_status = _lr_parse(chunk, '"status":"', '"')
+        if families and isinstance(families, list) and len(families) > 0:
+            fam = families[0]
+            if isinstance(fam, dict):
+                plan_name = str(fam.get("name") or "")
+                plan_type = str(fam.get("type") or "")
+                auto_renewal = str(fam.get("paymentEventType") or "")
+                account_status = str(fam.get("status") or "")
 
-        # Fallback: direct JSON for status
+                # paymentProviderInfo.type
+                ppi = fam.get("paymentProviderInfo")
+                if isinstance(ppi, dict):
+                    payment_provider = str(ppi.get("type") or "")
+
+                # expiryTimestamp → Expiry Date + Days Left
+                expiry_ms = fam.get("expiryTimestamp")
+                if expiry_ms and isinstance(expiry_ms, (int, float)):
+                    try:
+                        if expiry_ms > 0:
+                            dt = datetime.fromtimestamp(expiry_ms / 1000)
+                            expiry_date = dt.strftime("%Y-%m-%d")
+                            days_left = str(
+                                max(0, (dt - datetime.now()).days)
+                            )
+                    except Exception:
+                        pass
+
+        # ── Fallback: recursive JSON search if direct path missed ──────
+        if not account_status and data:
+            val = _find_json_value(data, "status")
+            if val and isinstance(val, str):
+                account_status = val
+        if not plan_name and data:
+            val = _find_json_value(data, "name")
+            if val:
+                plan_name = str(val)
+
+        # ── Fallback: LR text parsing for status ──────────────────────
         if not account_status:
-            try:
-                if data is None:
-                    data = r2.json()
-                val = _find_json_value(data, "status")
-                if val and isinstance(val, str):
-                    account_status = val
-            except Exception:
-                pass
+            chunk = _lr_parse(
+                r2_text, '"displayStyle":', '"paymentProviderInfo"'
+            )
+            if chunk:
+                account_status = _lr_parse(chunk, '"status":"', '",')
+                if not account_status:
+                    account_status = _lr_parse(
+                        chunk, '"status":"', '"'
+                    )
 
-        # Expiry timestamp
-        # SB: PARSE "<SOURCE>" LR '"expiryTimestamp":' ',"'
-        expiry_raw = _lr_parse(r2_text, '"expiryTimestamp":', ',"')
-        if not expiry_raw:
-            expiry_raw = _lr_parse(r2_text, '"expiryTimestamp":', ',')
-        if not expiry_raw:
-            # JSON fallback
-            try:
-                ts = _find_json_value(
-                    data if data else r2.json(), "expiryTimestamp"
-                )
-                if ts:
-                    expiry_raw = str(ts)
-            except Exception:
-                pass
+        # ── Fallback: LR for payment provider ─────────────────────────
+        if not payment_provider:
+            payment_provider = _lr_parse(
+                r2_text,
+                '"paymentProviderInfo":{"type":"',
+                '"',
+            )
 
-        if expiry_raw:
-            try:
-                expiry_ms = int(str(expiry_raw).strip())
-                if expiry_ms > 0:
-                    dt = datetime.fromtimestamp(expiry_ms / 1000)
-                    expiry_date = dt.strftime("%Y-%m-%d")
-                    days_left = str(max(0, (dt - datetime.now()).days))
-            except Exception:
-                pass
+        # ── Fallback: LR for expiry timestamp ─────────────────────────
+        if expiry_date == "N/A":
+            expiry_raw = _lr_parse(
+                r2_text, '"expiryTimestamp":', ','
+            )
+            if expiry_raw:
+                try:
+                    ts = int(str(expiry_raw).strip().rstrip(',"'))
+                    if ts > 0:
+                        dt = datetime.fromtimestamp(ts / 1000)
+                        expiry_date = dt.strftime("%Y-%m-%d")
+                        days_left = str(
+                            max(0, (dt - datetime.now()).days)
+                        )
+                except Exception:
+                    pass
 
         # ── SB KEYCHECK ─────────────────────────────────────────────────
         # Success = Account Status is exactly "ACTIVE"
